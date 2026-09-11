@@ -41,6 +41,7 @@ return view.extend({
 		o = s.option(form.Flag, 'enabled', _('On'));
 		o.default = '1';
 		o.editable = true;
+		o.rmempty = false;
 		o.width = '60px';
 
 		o = s.option(form.Value, 'src', _('Device'),

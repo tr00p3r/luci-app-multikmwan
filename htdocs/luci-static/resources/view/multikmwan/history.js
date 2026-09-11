@@ -25,6 +25,8 @@ var CSS = '' +
 var PALETTE = ['#2a6fb5', '#1f8b4c', '#d9a400', '#b3312c', '#7a4fb5', '#0f8b8b'];
 
 function num(v) { var n = parseFloat(v); return isNaN(n) ? 0 : n; }
+// Speeds: whole numbers at 10 Mbps and up, one decimal below 10.
+function fmtSpeed(v) { var n = num(v); return n >= 10 ? String(Math.round(n)) : n.toFixed(1); }
 
 // Group flat day rows into { wan: [rows...] } and a sorted date list.
 function group(days) {
@@ -107,10 +109,13 @@ return view.extend({
 			var rows = g.byWan[wn];
 			var up = uptimePct(rows);
 			var outages = 0, dlmax = 0, dlsum = 0, dln = 0, rttsum = 0, rttn = 0;
+				var ulmax = 0, ulsum = 0, uln = 0;
 			rows.forEach(function(r) {
 				outages += num(r.outages);
 				dlmax = Math.max(dlmax, num(r.dl_max));
 				if (num(r.dl_avg) > 0) { dlsum += num(r.dl_avg); dln++; }
+					ulmax = Math.max(ulmax, num(r.ul_max));
+					if (num(r.ul_avg) > 0) { ulsum += num(r.ul_avg); uln++; }
 				if (num(r.rtt_avg) > 0) { rttsum += num(r.rtt_avg); rttn++; }
 			});
 			function row(k, v, cls) {
@@ -125,8 +130,10 @@ return view.extend({
 				row(_('Days recorded'), String(rows.length)),
 				row(_('Uptime'), up === null ? '-' : up.toFixed(2) + '%', upClass(up)),
 				row(_('Outages'), String(outages)),
-				row(_('Avg download'), dln ? (dlsum / dln).toFixed(1) + ' Mbps' : '-'),
-				row(_('Peak download'), dlmax ? dlmax.toFixed(1) + ' Mbps' : '-'),
+				row(_('Avg download'), dln ? fmtSpeed(dlsum / dln) + ' Mbps' : '-'),
+				row(_('Peak download'), dlmax ? fmtSpeed(dlmax) + ' Mbps' : '-'),
+					row(_('Avg upload'), uln ? fmtSpeed(ulsum / uln) + ' Mbps' : '-'),
+					row(_('Peak upload'), ulmax ? fmtSpeed(ulmax) + ' Mbps' : '-'),
 				row(_('Avg latency'), rttn ? (rttsum / rttn).toFixed(0) + ' ms' : '-'),
 				E('div', { 'style': 'margin-top:8px' }, [ trend(rows, g.dates, color[wn]) ])
 			]);
@@ -149,7 +156,8 @@ return view.extend({
 					E('span', { 'class': upClass(up) },
 						up === null ? '-' : up.toFixed(1) + '%'),
 					E('span', { 'class': 'mk-dim' },
-						num(r.dl_avg) ? '  ·  ' + num(r.dl_avg).toFixed(0) + ' Mbps' : ''),
+						(num(r.dl_avg) || num(r.ul_avg))
+							? '  ·  ↓' + fmtSpeed(r.dl_avg) + ' ↑' + fmtSpeed(r.ul_avg) + ' Mbps' : ''),
 					num(r.outages) > 0 ? E('span', { 'class': 'mh-up-bad' },
 						'  ·  ' + r.outages + _(' drop(s)')) : ''
 				]));

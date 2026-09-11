@@ -56,6 +56,12 @@ var prev = {};
 
 function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
 function fmt1(v) { var n = num(v); return n === null ? '-' : n.toFixed(1); }
+// Speeds: whole numbers at 10 Mbps and up, one decimal below 10.
+function fmtSpeed(v) {
+	var n = num(v);
+	if (n === null) return '-';
+	return n >= 10 ? String(Math.round(n)) : n.toFixed(1);
+}
 
 function ago(epoch, now) {
 	var e = num(epoch);
@@ -154,12 +160,12 @@ return view.extend({
 						E('b', {}, num(w.loss) !== null ? w.loss + '%' : '-') ]),
 					E('div', { 'class': 'mk-stat' }, [ E('span', {}, _('live now')),
 						E('b', {}, live
-							? '↓' + fmt1(live.down) + '  ↑' + fmt1(live.up) + ' Mbps'
+							? '↓' + fmtSpeed(live.down) + '  ↑' + fmtSpeed(live.up) + ' Mbps'
 							: '…') ])
 				]),
 				E('div', { 'class': 'mk-speed' }, sp
-					? [ E('span', {}, [ E('b', {}, fmt1(sp.down)), _(' down') ]),
-					    E('span', {}, [ E('b', {}, fmt1(sp.up)), _(' up Mbps') ]),
+					? [ E('span', {}, [ E('b', {}, fmtSpeed(sp.down)), _(' down') ]),
+					    E('span', {}, [ E('b', {}, fmtSpeed(sp.up)), _(' up Mbps') ]),
 					    E('span', { 'class': 'mk-dim' }, _('tested ') + ago(sp.epoch, now)) ]
 					: [ E('span', { 'class': 'mk-dim' }, spNote) ]),
 				E('div', { 'class': 'mk-bar' }, [
@@ -187,8 +193,10 @@ return view.extend({
 		var rows = clients.map(function(c) {
 			var role = c.mode && c.mode !== 'order' ? c.mode : null;
 			var order = (c.order || '').trim().split(/\s+/).filter(Boolean);
-			var live = c.live && !prefOff;
-			var badge = c.enabled !== '1'
+			// enabled defaults to on: only an explicit '0' means off (matches the
+			// engine's config_get_bool default and the Client Preference page).
+			var off = (c.enabled === '0');
+			var badge = off
 				? { t: _('off'), cls: 'mk-idle' }
 				: (prefOff ? { t: _('preference off'), cls: 'mk-warn' }
 				           : (c.live ? { t: _('active'), cls: 'mk-ok' }

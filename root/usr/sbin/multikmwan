@@ -301,10 +301,24 @@ st_one() {
 	echo "$w $dl $ul $stt"
 }
 
+# Current in-use throughput on a WAN's device (rx+tx), sampled over ~1s.
+wan_busy_mbps() {
+	local dev="$1" r1 t1 r2 t2
+	r1=$(cat /sys/class/net/"$dev"/statistics/rx_bytes 2>/dev/null)
+	t1=$(cat /sys/class/net/"$dev"/statistics/tx_bytes 2>/dev/null)
+	sleep 1
+	r2=$(cat /sys/class/net/"$dev"/statistics/rx_bytes 2>/dev/null)
+	t2=$(cat /sys/class/net/"$dev"/statistics/tx_bytes 2>/dev/null)
+	awk -v a="${r1:-0}" -v b="${r2:-0}" -v c="${t1:-0}" -v d="${t2:-0}" \
+		'BEGIN{ v=((b-a)+(d-c))*8/1000000; if (v<0) v=0; printf "%.1f", v }'
+}
+
 cmd_speedtest() {
-	local targets="$*" w line explicit=1
+	local targets="$*" w line explicit=1 guard thr dev busy prior
 	collect_wans
 	[ -n "$targets" ] || { targets="$WANS"; explicit=0; }
+	guard=$(g busy_skip 1)
+	thr=$(g busy_mbps 20)
 	local tmp="$SPEED_FILE.$$"
 	echo "# wan down_mbps up_mbps status epoch" > "$tmp"
 	for w in $targets; do
@@ -313,6 +327,24 @@ cmd_speedtest() {
 			echo "$w 0 0 metered $(date +%s)" >> "$tmp"
 			log "speedtest: $w is metered - skipped"
 			continue
+		fi
+		# Don't test a link that's already busy (scheduled runs only): the test
+		# would only see spare capacity (under-reporting) and would fight real
+		# traffic. Carry the last good result forward instead. A manual run
+		# (a named target) always tests.
+		if [ "$explicit" = 0 ] && [ "$guard" = "1" ]; then
+			dev=$(wan_dev "$w")
+			busy=$(wan_busy_mbps "$dev")
+			if awk -v x="$busy" -v t="$thr" 'BEGIN{ exit !(x+0 > t+0) }'; then
+				prior=$(grep "^$w " "$SPEED_FILE" 2>/dev/null | grep -v busy | head -1)
+				if [ -n "$prior" ]; then
+					echo "$prior" >> "$tmp"       # keep last good line verbatim
+				else
+					echo "$w 0 0 busy $(date +%s)" >> "$tmp"
+				fi
+				log "speedtest: $w busy (${busy} Mbps in use > ${thr}) - skipped"
+				continue
+			fi
 		fi
 		log "speedtest: $w ..."
 		line=$(st_one "$w")

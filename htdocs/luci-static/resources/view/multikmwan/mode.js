@@ -200,6 +200,18 @@ return view.extend({
 		[ 1, 2, 4, 8, 16 ].forEach(function(n) { o.value(String(n), String(n)); });
 		mkopt('st_streams', '4');
 
+		o = s.option(form.Flag, '_busy_skip', _('Skip when busy'),
+			_('Skip a scheduled/auto test on a link that is already in use, and ' +
+			  'keep its last result. Avoids under-reporting and disrupting live ' +
+			  'traffic. Manual "Run speed test" always runs.'));
+		mkopt('busy_skip', '1');
+
+		o = s.option(form.Value, '_busy_mbps', _('Busy threshold'),
+			_('Mbps of current traffic (down+up) above which a link counts as busy ' +
+			  'and its scheduled test is skipped.'));
+		o.datatype = 'range(1,10000)';
+		mkopt('busy_mbps', '20');
+
 		// --- your own speed-test servers (separate map: profiles live in the
 		//     multikmwan config, not kmwan, so the grid must bind to it) ---
 		var m2 = new form.Map('multikmwan');

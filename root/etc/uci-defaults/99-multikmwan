@@ -23,6 +23,8 @@ set multikmwan.global.auto_rank=0
 set multikmwan.global.auto_bytes=10000000
 set multikmwan.global.auto_margin=15
 set multikmwan.global.st_streams=4
+set multikmwan.global.busy_skip=1
+set multikmwan.global.busy_mbps=20
 EOF
 	uci commit multikmwan
 fi

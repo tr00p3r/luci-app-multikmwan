@@ -315,6 +315,7 @@ case "$1" in
 		json_add_object "geo";       json_close_object
 		json_add_object "rank";      json_add_string "by" "str"; json_add_string "what" "str"; json_close_object
 		json_add_object "setmode";   json_add_string "mode" "str"; json_close_object
+		json_add_object "applymode"; json_close_object
 		json_dump
 		;;
 	call)
@@ -334,6 +335,23 @@ case "$1" in
 				[ -n "$up" ] && uci set multikmwan."$sid".up_url="$up"
 				uci commit multikmwan
 				json_init; json_add_string result "$sid"; json_dump ;;
+			applymode)
+				# Translate the committed mode_pref into kmwan settings, server-side
+				# (reads the freshly-saved value, avoiding stale JS uci state).
+				pref=$(uci -q get multikmwan.global.mode_pref); [ -n "$pref" ] || pref=failover
+				case "$pref" in
+					balancing) km=balancing ;;
+					*) km=failover ;;
+				esac
+				uci set kmwan.global.mode="$km"
+				if [ "$pref" = "fastest" ]; then
+					ar=$(uci -q get multikmwan.global.auto_rank)
+					{ [ -n "$ar" ] && [ "$ar" -gt 0 ] 2>/dev/null; } || uci set multikmwan.global.auto_rank=15
+				fi
+				uci commit kmwan
+				uci commit multikmwan
+				/etc/init.d/kmwan restart >/dev/null 2>&1
+				json_init; json_add_string result "$pref"; json_dump ;;
 			sync)
 				json_init
 				json_add_string result "$(/usr/sbin/multikmwan sync 2>&1 | tail -3)"

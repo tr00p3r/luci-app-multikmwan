@@ -7,6 +7,7 @@
 
 var callSetMode = rpc.declare({ object: 'luci.multikmwan', method: 'setmode',
                                 params: [ 'mode' ] });
+var callApplyMode = rpc.declare({ object: 'luci.multikmwan', method: 'applymode' });
 var callStServers = rpc.declare({ object: 'luci.multikmwan', method: 'stservers',
                                   params: [ 'search' ] });
 var callAddServer = rpc.declare({ object: 'luci.multikmwan', method: 'add_server',
@@ -102,6 +103,10 @@ return view.extend({
 		o.value('balancing', _('Load balance — share by ratio'));
 		o.value('fastest', _('Fastest — always the fastest link (auto-tested)'));
 		o.cfgvalue = function() {
+			// The user's stored choice is the source of truth; fall back to a
+			// derivation only for configs from before mode_pref existed.
+			var mp = uci.get('multikmwan', 'global', 'mode_pref');
+			if (mp) return mp;
 			var km = uci.get('kmwan', 'global', 'mode') || 'failover';
 			var ar = parseInt(uci.get('multikmwan', 'global', 'auto_rank') || '0', 10);
 			if (km !== 'failover') return 'balancing';
@@ -291,21 +296,21 @@ return view.extend({
 	},
 
 	handleSaveApply: function(ev) {
+		// Save + commit the maps, then let the backend translate mode_pref into
+		// kmwan settings (reads the committed value, so no stale-uci races) and
+		// restart kmwan. uci.apply here can report "no data" on this firmware
+		// even though it commits, so its error is swallowed; applymode is the
+		// authoritative step and reloads state.
 		return this.handleSave(ev).then(function() {
-			// Translate the meta-mode into kmwan mode + auto-rank.
-			var pref = uci.get('multikmwan', 'global', 'mode_pref') || 'failover';
-			var kmMode = (pref === 'balancing') ? 'balancing' : 'failover';
-			if (pref === 'fastest') {
-				var ar = parseInt(uci.get('multikmwan', 'global', 'auto_rank') || '0', 10);
-				if (!(ar > 0)) uci.set('multikmwan', 'global', 'auto_rank', '15');
-			}
-			uci.set('kmwan', 'global', 'mode', kmMode);
-			return uci.apply();          // commit kmwan + multikmwan to flash
+			return uci.apply().catch(function() {});
 		}).then(function() {
-			return callSetMode(uci.get('kmwan', 'global', 'mode') || 'failover');
+			return callApplyMode();
 		}).then(function() {
 			ui.addNotification(null,
 				E('p', _('Applied — kmwan restarted with the new settings.')), 'info');
+			window.setTimeout(function() { location.reload(); }, 700);
+		}).catch(function(e) {
+			ui.addNotification(null, E('p', _('Save failed: ') + (e.message || e)), 'error');
 		});
 	}
 });

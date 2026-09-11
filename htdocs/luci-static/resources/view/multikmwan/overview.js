@@ -207,11 +207,12 @@ return view.extend({
 					}))
 			]);
 		});
-		var note = prefOff
-			? E('div', { 'class': 'mk-note' },
-				_('Client preference is OFF — these rules are not applied. Turn it on on the Client Preference page.'))
-			: null;
-		return E('div', {}, [ note, E('div', { 'class': 'mk-clients' }, rows) ]);
+		var kids = [];
+		if (prefOff)
+			kids.push(E('div', { 'class': 'mk-note' },
+				_('Client preference is OFF — these rules are not applied. Turn it on on the Client Preference page.')));
+		kids.push(E('div', { 'class': 'mk-clients' }, rows));
+		return E('div', {}, kids);
 	},
 
 	// One grouped-bar chart for a metric (down or up) across recent runs.

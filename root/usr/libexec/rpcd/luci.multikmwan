@@ -268,8 +268,16 @@ clients_json() {
 # Nearest speedtest.net (Ookla) servers, ready to add as profiles. Each speaks
 # the classic HTTP protocol: download a random*.jpg, upload to upload.php.
 stservers_json() {
-	local list url base host i=0 n
-	list=$(curl -s --max-time 15 'https://www.speedtest.net/api/js/servers?engine=js&limit=25' 2>/dev/null)
+	local list url base host i=0 n input q qe api
+	read -r input
+	json_load "$input" 2>/dev/null
+	json_get_var q search
+	api="https://www.speedtest.net/api/js/servers?engine=js&limit=25"
+	if [ -n "$q" ]; then
+		qe=$(echo "$q" | sed 's/ /%20/g')
+		api="${api}&search=${qe}"
+	fi
+	list=$(curl -s --max-time 15 "$api" 2>/dev/null)
 	json_init
 	json_add_array servers
 	while [ $i -lt 25 ]; do
@@ -298,7 +306,7 @@ case "$1" in
 		json_add_object "status";    json_close_object
 		json_add_object "clients";   json_close_object
 		json_add_object "history";   json_close_object
-		json_add_object "stservers"; json_close_object
+		json_add_object "stservers"; json_add_string "search" "str"; json_close_object
 		json_add_object "add_server"; json_add_string "label" "str"; json_add_string "down" "str"; json_add_string "up" "str"; json_close_object
 		json_add_object "sync";      json_close_object
 		json_add_object "check";     json_close_object

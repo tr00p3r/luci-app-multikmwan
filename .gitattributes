@@ -1,0 +1,5 @@
+# The package ships to OpenWrt; every shipped file must stay LF or busybox
+# and opkg choke. Force LF regardless of the contributor's platform.
+* text=auto eol=lf
+*.png binary
+*.ipk binary

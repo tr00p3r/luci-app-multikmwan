@@ -1,0 +1,46 @@
+{
+	"admin/network/multikmwan": {
+		"title": "MultiKmwan",
+		"order": 25,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-multikmwan"
+			]
+		}
+	},
+	"admin/network/multikmwan/overview": {
+		"title": "Status & Speed",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "multikmwan/overview"
+		}
+	},
+	"admin/network/multikmwan/clients": {
+		"title": "Client Preference",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "multikmwan/clients"
+		}
+	},
+	"admin/network/multikmwan/mode": {
+		"title": "Mode & Priority",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "multikmwan/mode"
+		}
+	},
+	"admin/network/multikmwan/history": {
+		"title": "History (90d)",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "multikmwan/history"
+		}
+	}
+}

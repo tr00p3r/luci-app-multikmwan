@@ -1,0 +1,12 @@
+Package: luci-app-multikmwan
+Version: 1.0.0-1
+Depends: luci-base, curl
+Section: luci
+Category: LuCI
+Architecture: all
+Installed-Size: 0
+Maintainer: David
+Description: MultiKmwan - LuCI front-end for GL.iNet kmwan.
+ Switch kmwan between failover and load-balance, tune per-WAN priority
+ and load ratio, assign individual LAN clients to a preferred WAN via
+ policy routing, and rank WANs by measured download/upload speed.

@@ -1,0 +1,322 @@
+#!/bin/sh
+. /usr/share/libubox/jshn.sh
+
+SPEED_FILE=/tmp/multikmwan.speed
+HEALTH_FILE=/tmp/multikmwan.health
+GEO_FILE=/tmp/multikmwan.geo
+SPEEDHIST_FILE=/tmp/multikmwan.speedhist
+HIST_FILE=/etc/multikmwan/history.csv
+AUTO_FILE=/tmp/multikmwan.autorank
+
+# Stable per-WAN colour, assigned by IPv4 kmwan-member order so every page
+# (cards, graphs, history) shows the same WAN in the same colour. Prints
+# "<name> <hex>" per member.
+mk_wan_palette() {
+	local i=0 w hex
+	for w in $(uci show kmwan 2>/dev/null | grep '=member' | cut -d. -f2 | cut -d= -f1); do
+		[ "$(uci -q get kmwan.$w.addr_type)" = "4" ] || continue
+		case $((i % 6)) in
+			0) hex="#2a6fb5" ;; 1) hex="#1f8b4c" ;; 2) hex="#d9a400" ;;
+			3) hex="#b3312c" ;; 4) hex="#7a4fb5" ;; 5) hex="#0f8b8b" ;;
+		esac
+		echo "$w $hex"
+		i=$((i + 1))
+	done
+}
+
+wans_json() {
+	local pal
+	pal=$(mk_wan_palette)
+	local w st dev ifup uptime gw state ptx prx kmst rxb txb
+	local rtt loss hep pubip isp city region country gep line oIFS base mode rf
+	mode=$(uci -q get kmwan.global.mode)
+	json_init
+	json_add_string mode "${mode:-failover}"
+	json_add_string enabled "$(uci -q get multikmwan.global.enabled)"
+	json_add_int now "$(date +%s)"
+
+	json_add_object autorank
+	json_add_string interval "$(uci -q get multikmwan.global.auto_rank)"
+	json_add_string margin "$(uci -q get multikmwan.global.auto_margin)"
+	if [ -f "$AUTO_FILE" ]; then
+		set -- $(cat "$AUTO_FILE")
+		json_add_string epoch "$1"; json_add_string decision "$2"; shift 2
+		json_add_string order "$*"
+	fi
+	json_close_object
+
+	json_add_array wans
+
+	for w in $(uci show kmwan 2>/dev/null | grep '=member' | cut -d. -f2 | cut -d= -f1); do
+		[ "$(uci -q get kmwan.$w.addr_type)" = "4" ] || continue
+		st=$(ubus call network.interface.$w status 2>/dev/null)
+		dev=$(echo "$st" | jsonfilter -q -e '@.l3_device')
+		[ -n "$dev" ] || continue
+		ifup=$(echo "$st" | jsonfilter -q -e '@.up')
+		uptime=$(echo "$st" | jsonfilter -q -e '@.uptime')
+
+		gw=$(ip route show table main 2>/dev/null | \
+			awk -v d="$dev" '$1=="default" && $5==d {print $3; exit}')
+		[ -n "$gw" ] || gw=$(ip route show table main 2>/dev/null | \
+			awk -v d="$dev" '$1=="nexthop" && $5==d {print $3; exit}')
+
+		# kmwan's own view. /proc/gl-kmwan/status columns:
+		#  1 iface 2 netdev 3 ifindex 4 State 5 TrackMode 6 TX pkts 7 TX stamp 8 RX pkts 9 RX stamp
+		line=$(grep -E "^$w[[:space:]]" /proc/gl-kmwan/status 2>/dev/null | head -1)
+		state=$(echo "$line" | awk '{print $4}')
+		ptx=$(echo "$line" | awk '{print $6}')
+		prx=$(echo "$line" | awk '{print $8}')
+		kmst=$(grep -E "^$w:" /proc/gl-kmwan/config 2>/dev/null | cut -d: -f2)
+
+		rxb=$(cat /sys/class/net/$dev/statistics/rx_bytes 2>/dev/null)
+		txb=$(cat /sys/class/net/$dev/statistics/tx_bytes 2>/dev/null)
+
+		rtt=""; loss=""; hep=""
+		if [ -f "$HEALTH_FILE" ]; then
+			set -- $(grep "^$w " "$HEALTH_FILE" 2>/dev/null)
+			rtt="$2"; loss="$3"; hep="$4"
+		fi
+
+		pubip=""; isp=""; city=""; region=""; country=""; gep=""
+		if [ -f "$GEO_FILE" ]; then
+			line=$(grep "^$w|" "$GEO_FILE" 2>/dev/null | head -1)
+			if [ -n "$line" ]; then
+				oIFS="$IFS"; IFS='|'; set -- $line; IFS="$oIFS"
+				pubip="$2"; isp="$3"; city="$4"; region="$5"; country="$6"; gep="$7"
+			fi
+		fi
+
+		json_add_object ""
+		json_add_string name "$w"
+		json_add_string color "$(echo "$pal" | awk -v w="$w" '$1==w{print $2}')"
+		json_add_string device "$dev"
+		json_add_string gateway "${gw:-}"
+		json_add_string metric "$(uci -q get kmwan.$w.metric)"
+		json_add_string weight "$(uci -q get kmwan.$w.weight)"
+		json_add_string disabled "$(uci -q get kmwan.$w.disabled)"
+		json_add_string metered "$(uci -q get multikmwan.$w.metered)"
+		json_add_boolean link "$([ "$ifup" = "true" ] && echo 1 || echo 0)"
+		json_add_int uptime "${uptime:-0}"
+		json_add_boolean up "$([ -n "$gw" ] && echo 1 || echo 0)"
+		json_add_string kmwan "${kmst:-}"
+		json_add_string state "${state:-}"
+		json_add_string probe_tx "${ptx:-}"
+		json_add_string probe_rx "${prx:-}"
+		json_add_string rtt "${rtt:-}"
+		json_add_string loss "${loss:-}"
+		json_add_string health_epoch "${hep:-}"
+		json_add_string rx_bytes "${rxb:-0}"
+		json_add_string tx_bytes "${txb:-0}"
+		json_add_string pubip "${pubip:-}"
+		json_add_string isp "${isp:-}"
+		json_add_string city "${city:-}"
+		json_add_string region "${region:-}"
+		json_add_string country "${country:-}"
+		json_add_string geo_epoch "${gep:-}"
+		json_close_object
+	done
+	json_close_array
+
+	# NB: no pipes into these loops. jshn keeps its state in shell variables,
+	# and a `cmd | while read` body runs in a subshell whose json_add_* calls
+	# are silently lost. Read from a redirect instead.
+	json_add_array speed
+	if [ -f "$SPEED_FILE" ]; then
+		while read -r w d u st e; do
+			[ -n "$w" ] || continue
+			[ "${w#\#}" = "$w" ] || continue
+			json_add_object ""
+			json_add_string name "$w"
+			json_add_string down "$d"
+			json_add_string up "$u"
+			json_add_string status "$st"
+			json_add_string epoch "$e"
+			json_close_object
+		done < "$SPEED_FILE"
+	fi
+	json_close_array
+
+	json_add_array rules
+	base=$(uci -q get multikmwan.global.rule_base); [ -n "$base" ] || base=2000
+	rf="/tmp/multikmwan.rules.$$"
+	ip rule show 2>/dev/null | awk -F: -v lo="$base" -v hi="$((base+999))" 		'{pr=$1+0} pr>=lo && pr<=hi {sub(/^[0-9]+:[[:space:]]*/,""); print}' > "$rf"
+	while read -r line; do
+		[ -n "$line" ] || continue
+		json_add_object ""
+		json_add_string rule "$line"
+		json_close_object
+	done < "$rf"
+	rm -f "$rf"
+	json_close_array
+
+	# Configured client rules (from config), each with whether it is currently
+	# live (an ip rule exists for its source). Lets the UI show a device that
+	# is set up but inactive because client preference is off.
+	json_add_array clients
+	local live_rules
+	live_rules=$(ip rule show 2>/dev/null)
+	for cs in $(uci show multikmwan 2>/dev/null | sed -n 's/^multikmwan\.\([^.]*\)=client$/\1/p'); do
+		src=$(uci -q get multikmwan.$cs.src)
+		[ -n "$src" ] || continue
+		json_add_object ""
+		json_add_string label "$(uci -q get multikmwan.$cs.label)"
+		json_add_string src "$src"
+		json_add_string order "$(uci -q get multikmwan.$cs.order | tr '\n' ' ')"
+		json_add_string enabled "$(uci -q get multikmwan.$cs.enabled)"
+		json_add_boolean live "$(echo "$live_rules" | grep -q "from $src " && echo 1 || echo 0)"
+		json_close_object
+	done
+	json_close_array
+
+	# Ring of recent speed runs, for the status-page graph. Each line:
+	#   epoch wan:down:up wan2:down:up ...
+	json_add_array speedhist
+	if [ -f "$SPEEDHIST_FILE" ]; then
+		while read -r epoch rest; do
+			[ -n "$epoch" ] || continue
+			json_add_object ""
+			json_add_string epoch "$epoch"
+			json_add_array wans
+			for tok in $rest; do
+				json_add_object ""
+				json_add_string name "${tok%%:*}"
+				json_add_string down "$(echo "$tok" | cut -d: -f2)"
+				json_add_string up "$(echo "$tok" | cut -d: -f3)"
+				json_close_object
+			done
+			json_close_array
+			json_close_object
+		done < "$SPEEDHIST_FILE"
+	fi
+	json_close_array
+	json_dump
+}
+
+# 90-day daily history rolled into per-WAN summaries + day arrays for the
+# History page. Reads the flat CSV (date,wan,up,down,rtt_sum,rtt_n,loss_sum,
+# loss_n,outages,dl_sum,dl_n,dl_max,ul_sum,ul_n,ul_max).
+history_json() {
+	local hf="$HIST_FILE" pal
+	pal=$(mk_wan_palette)
+	json_init
+	json_add_array days
+	if [ -f "$hf" ]; then
+		while IFS=, read -r date wan up down rs rn ls ln out ds dn dmax us un umax; do
+			[ -n "$date" ] || continue
+			json_add_object ""
+			json_add_string date "$date"
+			json_add_string wan "$wan"
+			json_add_string color "$(echo "$pal" | awk -v w="$wan" '$1==w{print $2}')"
+			json_add_int up "${up:-0}"
+			json_add_int down "${down:-0}"
+			json_add_int outages "${out:-0}"
+			json_add_string rtt_avg "$(awk -v s="$rs" -v n="$rn" 'BEGIN{printf "%.1f", (n>0?s/n:0)}')"
+			json_add_string loss_avg "$(awk -v s="$ls" -v n="$ln" 'BEGIN{printf "%.1f", (n>0?s/n:0)}')"
+			json_add_string dl_avg "$(awk -v s="$ds" -v n="$dn" 'BEGIN{printf "%.1f", (n>0?s/n:0)}')"
+			json_add_string dl_max "${dmax:-0}"
+			json_add_string ul_avg "$(awk -v s="$us" -v n="$un" 'BEGIN{printf "%.1f", (n>0?s/n:0)}')"
+			json_add_string ul_max "${umax:-0}"
+			json_close_object
+		done < "$hf"
+	fi
+	json_close_array
+	json_dump
+}
+
+# Known LAN hosts, so the UI can offer a picker instead of typed IPs.
+# Static reservations come first - a dynamic lease can change address and
+# silently stop matching the rule.
+clients_json() {
+	local i=0 mac ip name exp cid
+	json_init
+	json_add_array clients
+
+	while [ $i -lt 128 ]; do
+		mac=$(uci -q get dhcp.@host[$i].mac)
+		[ -n "$mac" ] || break
+		ip=$(uci -q get dhcp.@host[$i].ip)
+		name=$(uci -q get dhcp.@host[$i].name)
+		[ -n "$name" ] || name=$(uci -q get dhcp.@host[$i].tag)
+		if [ -n "$ip" ]; then
+			json_add_object ""
+			json_add_string ip "$ip"
+			json_add_string mac "$mac"
+			json_add_string name "$name"
+			json_add_boolean static 1
+			json_close_object
+		fi
+		i=$((i + 1))
+	done
+
+	if [ -f /tmp/dhcp.leases ]; then
+		while read -r exp mac ip name cid; do
+			[ -n "$ip" ] || continue
+			json_add_object ""
+			json_add_string ip "$ip"
+			json_add_string mac "$mac"
+			json_add_string name "$name"
+			json_add_boolean static 0
+			json_close_object
+		done < /tmp/dhcp.leases
+	fi
+
+	json_close_array
+	json_dump
+}
+
+case "$1" in
+	list)
+		json_init
+		json_add_object "status";    json_close_object
+		json_add_object "clients";   json_close_object
+		json_add_object "history";   json_close_object
+		json_add_object "sync";      json_close_object
+		json_add_object "check";     json_close_object
+		json_add_object "speedtest"; json_close_object
+		json_add_object "health";    json_close_object
+		json_add_object "geo";       json_close_object
+		json_add_object "rank";      json_add_string "by" "str"; json_add_string "what" "str"; json_close_object
+		json_add_object "setmode";   json_add_string "mode" "str"; json_close_object
+		json_dump
+		;;
+	call)
+		case "$2" in
+			status)  wans_json ;;
+			clients) clients_json ;;
+			history) history_json ;;
+			sync)
+				json_init
+				json_add_string result "$(/usr/sbin/multikmwan sync 2>&1 | tail -3)"
+				json_dump ;;
+			check)
+				json_init
+				json_add_string result "$(/usr/sbin/multikmwan check 2>&1)"
+				json_dump ;;
+			speedtest)
+				(/usr/sbin/multikmwan speedtest >/dev/null 2>&1 &)
+				json_init; json_add_string result "started"; json_dump ;;
+			health)
+				(/usr/sbin/multikmwan health >/dev/null 2>&1 &)
+				json_init; json_add_string result "started"; json_dump ;;
+			geo)
+				(/usr/sbin/multikmwan geo force >/dev/null 2>&1 &)
+				json_init; json_add_string result "started"; json_dump ;;
+			rank)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var by by; json_get_var what what
+				[ -n "$by" ] || by=sum
+				[ -n "$what" ] || what=both
+				json_init
+				json_add_string result "$(/usr/sbin/multikmwan rank "$by" "$what" 2>&1)"
+				json_dump ;;
+			setmode)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var mode mode
+				json_init
+				json_add_string result "$(/usr/sbin/multikmwan mode "$mode" 2>&1)"
+				json_dump ;;
+		esac
+		;;
+esac

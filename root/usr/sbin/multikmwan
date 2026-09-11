@@ -1,0 +1,711 @@
+#!/bin/sh
+# multikmwan - per-client WAN preference + speed ranking on top of GL kmwan.
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+SPEED_FILE=/tmp/multikmwan.speed
+HEALTH_FILE=/tmp/multikmwan.health
+GEO_FILE=/tmp/multikmwan.geo
+AUTO_FILE=/tmp/multikmwan.autorank
+SPEEDHIST_FILE=/tmp/multikmwan.speedhist
+# Persistent 90-day history lives on flash. Kept tiny: one rolled-up row per
+# WAN per day, flushed at most hourly, pruned to HIST_DAYS. An in-RAM
+# accumulator absorbs the frequent samples so flash is barely touched.
+HIST_DIR=/etc/multikmwan
+HIST_FILE=$HIST_DIR/history.csv
+ACC_FILE=/tmp/multikmwan.acc
+STATE_FILE=/tmp/multikmwan.wanstate
+HIST_DAYS=90
+LOCK=/var/lock/multikmwan.lock
+WANS=""
+
+log() { logger -t multikmwan "$*"; [ -t 1 ] && echo "$*"; }
+
+g() {
+	local _v
+	config_load multikmwan
+	config_get _v global "$1" "$2"
+	echo "$_v"
+}
+
+TABLE_BASE=$(g table_base 200)
+RULE_BASE=$(g rule_base 2000)
+RULE_MAX=$((RULE_BASE + 999))
+
+# ---------------------------------------------------------------- wan list
+_wan_cb() {
+	local s="$1" iface addr_type dev
+	config_get addr_type "$s" addr_type 4
+	[ "$addr_type" = "4" ] || return 0
+	config_get iface "$s" interface
+	[ -n "$iface" ] || return 0
+	network_get_device dev "$iface" 2>/dev/null
+	[ -n "$dev" ] || return 0
+	WANS="$WANS $iface"
+}
+
+collect_wans() {
+	WANS=""
+	config_load kmwan
+	config_foreach _wan_cb member
+	WANS=$(echo $WANS)
+}
+
+wan_dev() { local d; network_get_device d "$1" 2>/dev/null; echo "$d"; }
+
+wan_gw() {
+	local dev="$1"
+	ip route show table main 2>/dev/null | \
+		awk -v d="$dev" '$1=="default" && $4=="dev" && $5==d {print $3; exit}'
+	# balance mode puts the WANs in one multipath route instead
+	ip route show table main 2>/dev/null | \
+		awk -v d="$dev" '$1=="nexthop" && $5==d {print $3; exit}'
+}
+
+wan_table() {
+	local want="$1" i="$TABLE_BASE" w
+	for w in $WANS; do
+		[ "$w" = "$want" ] && { echo "$i"; return 0; }
+		i=$((i + 1))
+	done
+	return 1
+}
+
+# Backup-only / metered link: never speed-tested, ranked last with ratio 0.
+wan_metered() { [ "$(uci -q get multikmwan."$1".metered)" = "1" ]; }
+
+wan_up() {
+	local dev
+	dev=$(wan_dev "$1")
+	[ -n "$dev" ] || return 1
+	[ -n "$(wan_gw "$dev" | head -1)" ]
+}
+
+# ------------------------------------------------------------- table sync
+sync_tables() {
+	local w dev gw tbl r
+	for w in $WANS; do
+		tbl=$(wan_table "$w") || continue
+		ip route flush table "$tbl" 2>/dev/null
+		dev=$(wan_dev "$w")
+		[ -n "$dev" ] || continue
+		gw=$(wan_gw "$dev" | head -1)
+		# No gateway => WAN is down. Leaving the table empty makes the
+		# kernel fall through to this client's next preference.
+		[ -n "$gw" ] || continue
+		ip route show table main 2>/dev/null | grep -vE '^default|^nexthop|^\s' | \
+		while read -r r; do
+			[ -n "$r" ] && ip route add table "$tbl" $r 2>/dev/null
+		done
+		ip route add table "$tbl" default via "$gw" dev "$dev" 2>/dev/null
+	done
+}
+
+# -------------------------------------------------------------- rule sync
+flush_rules() {
+	local p n=0
+	while [ $n -lt 200 ]; do
+		p=$(ip rule show 2>/dev/null | awk -F: -v lo="$RULE_BASE" -v hi="$RULE_MAX" \
+			'{ pr=$1+0 } pr>=lo && pr<=hi { print pr; exit }')
+		[ -n "$p" ] || break
+		ip rule del pref "$p" 2>/dev/null || break
+		n=$((n + 1))
+	done
+}
+
+PREF=0
+_client_cb() {
+	local s="$1" enabled src order w tbl
+	config_get_bool enabled "$s" enabled 1
+	[ "$enabled" = 1 ] || return 0
+	config_get src "$s" src ""
+	[ -n "$src" ] || return 0
+	config_get order "$s" order ""
+	[ -n "$order" ] || return 0
+	for w in $order; do
+		tbl=$(wan_table "$w") || continue
+		[ "$PREF" -gt 999 ] && return 0
+		ip rule add from "$src" lookup "$tbl" pref $((RULE_BASE + PREF)) 2>/dev/null
+		PREF=$((PREF + 1))
+	done
+}
+
+sync_rules() {
+	PREF=0
+	config_load multikmwan
+	config_foreach _client_cb client
+}
+
+cmd_sync() {
+	local enabled
+	# LuCI's Save only stages to /tmp/.uci; make sure what we apply is
+	# also what survives a reboot.
+	[ -n "$(uci -q changes multikmwan)" ] && uci commit multikmwan
+	enabled=$(g enabled 0)
+	collect_wans
+	flush_rules
+	if [ "$enabled" != "1" ]; then
+		ip_flush_tables
+		return 0
+	fi
+	sync_tables
+	sync_rules
+	log "sync complete: wans='$WANS' rules=$PREF"
+}
+
+ip_flush_tables() {
+	local w tbl
+	for w in $WANS; do
+		tbl=$(wan_table "$w") && ip route flush table "$tbl" 2>/dev/null
+	done
+}
+
+cmd_flush() {
+	collect_wans
+	flush_rules
+	ip_flush_tables
+	log "flushed all multikmwan rules and tables"
+}
+
+# ------------------------------------------------------------------ modes
+cmd_mode() {
+	local m="$1"
+	case "$m" in
+		failover|balancing) ;;
+		"") uci -q get kmwan.global.mode; return 0 ;;
+		*) echo "usage: multikmwan mode [failover|balancing]" >&2; return 1 ;;
+	esac
+	uci set kmwan.global.mode="$m"
+	uci commit kmwan
+	/etc/init.d/kmwan restart >/dev/null 2>&1
+	log "kmwan mode set to $m"
+	echo "$m"
+}
+
+# ------------------------------------------------------------- speed test
+# Measures each WAN by binding curl to that WAN's device, so the result is
+# that link's throughput regardless of which one the routing table prefers.
+st_one() {
+	local w="$1" dev bytes to url_d url_u bd bu dl ul srv
+	dev=$(wan_dev "$w")
+	[ -n "$dev" ] || { echo "$w 0 0 nodev"; return 0; }
+	bytes=${ST_BYTES:-$(g st_bytes 25000000)}
+	to=$(g st_timeout 25)
+	# Active server profile (config server '<id>') wins; otherwise the inline
+	# custom URLs. Either way a profile's blank field falls back to the inline
+	# one, so you can define a download-only server.
+	srv=$(g active_server "")
+	url_d=""; url_u=""
+	if [ -n "$srv" ] && [ -n "$(uci -q get multikmwan.$srv)" ]; then
+		url_d=$(uci -q get multikmwan.$srv.down_url)
+		url_u=$(uci -q get multikmwan.$srv.up_url)
+	fi
+	[ -n "$url_d" ] || url_d=$(g st_down_url 'https://speed.cloudflare.com/__down?bytes={bytes}')
+	[ -n "$url_u" ] || url_u=$(g st_up_url 'https://speed.cloudflare.com/__up')
+	# "{bytes}" is substituted; a URL ending in "=" gets the size appended
+	# (old config format); anything else is fetched as-is (fixed-size file).
+	case "$url_d" in
+		*"{bytes}"*) url_d=$(echo "$url_d" | sed "s/{bytes}/$bytes/g") ;;
+		*=)          url_d="${url_d}${bytes}" ;;
+	esac
+
+	bd=$(curl -s -o /dev/null --interface "$dev" --max-time "$to" \
+		-w '%{speed_download}' "$url_d" 2>/dev/null)
+	[ -n "$bd" ] || bd=0
+
+	bu=$(dd if=/dev/zero bs=65536 count=$((bytes / 65536)) 2>/dev/null | \
+		curl -s -o /dev/null --interface "$dev" --max-time "$to" \
+		-H 'Content-Type: application/octet-stream' \
+		-w '%{speed_upload}' --data-binary @- "$url_u" 2>/dev/null)
+	[ -n "$bu" ] || bu=0
+
+	dl=$(awk -v b="$bd" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
+	ul=$(awk -v b="$bu" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
+	echo "$w $dl $ul ok"
+}
+
+cmd_speedtest() {
+	local targets="$*" w line explicit=1
+	collect_wans
+	[ -n "$targets" ] || { targets="$WANS"; explicit=0; }
+	local tmp="$SPEED_FILE.$$"
+	echo "# wan down_mbps up_mbps status epoch" > "$tmp"
+	for w in $targets; do
+		# A metered link is skipped unless named on the command line.
+		if [ "$explicit" = 0 ] && wan_metered "$w"; then
+			echo "$w 0 0 metered $(date +%s)" >> "$tmp"
+			log "speedtest: $w is metered - skipped"
+			continue
+		fi
+		log "speedtest: $w ..."
+		line=$(st_one "$w")
+		echo "$line $(date +%s)" >> "$tmp"
+		log "speedtest: $line"
+	done
+	mv "$tmp" "$SPEED_FILE"
+	hist_record_speed
+	hist_rollup speed
+	cat "$SPEED_FILE"
+}
+
+# Ring of the last N speed runs, for the status-page graph. Each line:
+#   epoch wan:down:up wan2:down:up ...   (only 'ok' results)
+HIST_KEEP=10
+hist_record_speed() {
+	local now toks w d u st e
+	now=$(date +%s)
+	toks=""
+	while read -r w d u st e; do
+		[ -n "$w" ] || continue
+		[ "${w#\#}" = "$w" ] || continue
+		[ "$st" = "ok" ] || continue
+		toks="$toks $w:$d:$u"
+	done < "$SPEED_FILE"
+	[ -n "$toks" ] || return 0
+	echo "$now$toks" >> "$SPEEDHIST_FILE"
+	# keep the last HIST_KEEP lines
+	tail -n "$HIST_KEEP" "$SPEEDHIST_FILE" > "$SPEEDHIST_FILE.$$" 2>/dev/null \
+		&& mv "$SPEEDHIST_FILE.$$" "$SPEEDHIST_FILE"
+}
+
+# --------------------------------------------------------------- ranking
+# Applies the last speed-test result to kmwan: metrics for failover order,
+# weights for the load-balance ratio.
+
+# Prints "score wan down up", fastest first, from the last speed test.
+rank_sorted() {
+	local by="$1" w d u st e score
+	[ -f "$SPEED_FILE" ] || return 1
+	while read -r w d u st e; do
+		[ -n "$w" ] || continue
+		[ "${w#\#}" = "$w" ] || continue
+		[ "$st" = "ok" ] || continue
+		if [ "$by" = "down" ]; then
+			score="$d"
+		elif [ "$by" = "up" ]; then
+			score="$u"
+		else
+			score=$(awk -v a="$d" -v b="$u" 'BEGIN{printf "%.2f", a+b}')
+		fi
+		echo "$score $w $d $u"
+	done < "$SPEED_FILE" | sort -rn
+}
+
+# Non-metered WANs in kmwan's current failover order (fastest-first as it stands).
+current_order() {
+	local w
+	collect_wans
+	for w in $WANS; do
+		wan_metered "$w" && continue
+		echo "$(uci -q get kmwan.$w.metric) $w"
+	done | sort -n | awk '{printf "%s ", $2}'
+}
+
+# stdin: rank_sorted output.  $1: metric|weight|both.  Applies + restarts kmwan.
+rank_apply() {
+	local what="${1:-both}" sorted score w d u max m=1 wt
+	sorted=$(cat)
+	[ -n "$sorted" ] || { echo "no usable results" >&2; return 1; }
+	max=$(echo "$sorted" | head -1 | awk '{print $1}')
+
+	echo "$sorted" | while read -r score w d u; do
+		if [ "$what" = "metric" ] || [ "$what" = "both" ]; then
+			uci set kmwan."$w".metric="$m"
+		fi
+		if [ "$what" = "weight" ] || [ "$what" = "both" ]; then
+			wt=$(awk -v s="$score" -v mx="$max" 'BEGIN{
+				if (mx <= 0) { print 1; exit }
+				v = int((s/mx)*10 + 0.5); if (v < 1) v = 1; if (v > 10) v = 10; print v }')
+			uci set kmwan."$w".weight="$wt"
+			echo "$w: metric=$m weight=$wt (score $score, ${d}down/${u}up)"
+		else
+			echo "$w: metric=$m (score $score)"
+		fi
+		m=$((m + 1))
+	done
+
+	# Metered / backup-only links: after everything measured, ranked last, ratio 0.
+	m=$(( $(echo "$sorted" | wc -l) + 1 ))
+	collect_wans
+	for w in $WANS; do
+		wan_metered "$w" || continue
+		if [ "$what" = "metric" ] || [ "$what" = "both" ]; then
+			uci set kmwan."$w".metric="$m"
+		fi
+		if [ "$what" = "weight" ] || [ "$what" = "both" ]; then
+			uci set kmwan."$w".weight="0"
+		fi
+		echo "$w: metric=$m weight=0 (metered - backup only)"
+		m=$((m + 1))
+	done
+
+	uci commit kmwan
+	/etc/init.d/kmwan restart >/dev/null 2>&1
+}
+
+cmd_rank() {
+	local by="${1:-$(g rank_by sum)}" what="${2:-both}"
+	[ -f "$SPEED_FILE" ] || { echo "no speed results; run: multikmwan speedtest" >&2; return 1; }
+	rank_sorted "$by" | rank_apply "$what" || return 1
+	log "ranked WANs by $by (applied to $what)"
+}
+
+# Scheduled re-rank. Re-tests with a smaller payload, then applies ONLY when
+# the leader actually changes AND the new leader beats the current one by
+# auto_margin percent -- every apply restarts kmwan (~7s re-probe + route
+# reload), so two lines of similar speed must not flip-flop.
+cmd_autorank() {
+	local by what margin bytes sorted proposed current
+	local new_lead new_score cur_lead cur_score now decision
+	by=$(g rank_by sum); what=$(g auto_what both)
+	margin=$(g auto_margin 15); bytes=$(g auto_bytes 10000000)
+	now=$(date +%s)
+
+	ST_BYTES="$bytes" cmd_speedtest >/dev/null 2>&1
+	sorted=$(rank_sorted "$by")
+	if [ -z "$sorted" ]; then
+		echo "$now no-results -" > "$AUTO_FILE"
+		log "autorank: no usable speed results"
+		return 1
+	fi
+	proposed=$(echo "$sorted" | awk '{printf "%s ", $2}')
+	current=$(current_order)
+
+	if [ "$proposed" = "$current" ]; then
+		decision="unchanged"
+	else
+		new_lead=$(echo "$sorted" | head -1 | awk '{print $2}')
+		new_score=$(echo "$sorted" | head -1 | awk '{print $1}')
+		cur_lead=${current%% *}
+		cur_score=$(echo "$sorted" | awk -v w="$cur_lead" '$2==w {print $1}')
+		if [ "$new_lead" = "$cur_lead" ]; then
+			decision="same-leader"
+		elif [ -n "$cur_score" ] && awk -v n="$new_score" -v c="$cur_score" -v m="$margin" \
+				'BEGIN{ exit !(n < c * (1 + m/100)) }'; then
+			decision="within-margin"
+		else
+			echo "$sorted" | rank_apply "$what" >/dev/null 2>&1
+			decision="applied"
+		fi
+	fi
+	echo "$now $decision $proposed" > "$AUTO_FILE"
+	log "autorank: $decision (measured: ${proposed}| current: ${current})"
+	echo "$decision: $proposed"
+}
+
+# procd service loop. health + sync + geo every interval; the scheduled
+# re-rank when auto_rank minutes have elapsed. Never on the first pass, so a
+# reboot does not open with a speed test.
+cmd_loop() {
+	local interval ar now last flushed day today
+	last=$(date +%s)
+	flushed=$(date +%s)
+	day=$(date +%Y-%m-%d)
+	while :; do
+		interval=$(g interval 20)
+		cmd_health >/dev/null 2>&1
+		hist_rollup health >/dev/null 2>&1
+		cmd_sync >/dev/null 2>&1
+		cmd_geo >/dev/null 2>&1
+		ar=$(g auto_rank 0)
+		now=$(date +%s)
+		if [ "${ar:-0}" -gt 0 ] && [ $((now - last)) -ge $((ar * 60)) ]; then
+			cmd_autorank >/dev/null 2>&1
+			last=$(date +%s)
+		fi
+		# Persist to flash at most hourly, and immediately on a date change so
+		# a day's totals are never split across a lost /tmp.
+		today=$(date +%Y-%m-%d)
+		if [ "$today" != "$day" ] || [ $((now - flushed)) -ge 3600 ]; then
+			hist_flush >/dev/null 2>&1
+			flushed=$(date +%s); day="$today"
+		fi
+		sleep "$interval"
+	done
+}
+
+# ------------------------------------------------------------------ health
+# Latency and loss per WAN, pinging out of that WAN's own device so the
+# answer is about that link rather than whichever one routing prefers.
+wan_track_ip() {
+	local t
+	t=$(uci -q get kmwan."$1".tracks | awk '{print $1}')
+	t="${t#ping,}"
+	echo "${t:-1.1.1.1}"
+}
+
+cmd_health() {
+	local w dev tgt out loss rtt now
+	collect_wans
+	now=$(date +%s)
+	local tmp="$HEALTH_FILE.$$"
+	: > "$tmp"
+	for w in $WANS; do
+		dev=$(wan_dev "$w")
+		if [ -z "$dev" ]; then
+			echo "$w - 100 $now" >> "$tmp"
+			continue
+		fi
+		tgt=$(wan_track_ip "$w")
+		out=$(ping -I "$dev" -c 3 -W 1 "$tgt" 2>/dev/null)
+		loss=$(echo "$out" | sed -n 's/.* \([0-9]*\)% packet loss.*/\1/p')
+		rtt=$(echo "$out" | sed -n 's|.*= [0-9.]*/\([0-9.]*\)/.*|\1|p')
+		[ -n "$loss" ] || loss=100
+		[ -n "$rtt" ] || rtt=-
+		echo "$w $rtt $loss $now" >> "$tmp"
+	done
+	mv "$tmp" "$HEALTH_FILE"
+	cat "$HEALTH_FILE"
+}
+
+# --------------------------------------------------------------------- geo
+# Public IP, ISP and rough location per WAN. Cached for 6h: the lookup is
+# rate-limited and only changes when the ISP re-addresses you.
+GEO_MAX_AGE=21600
+
+geo_one() {
+	local w="$1" dev j ip isp city region country
+	dev=$(wan_dev "$w")
+	[ -n "$dev" ] || return 1
+	j=$(curl -s --interface "$dev" --max-time 8 \
+		'http://ip-api.com/json/?fields=status,query,isp,org,city,regionName,countryCode' 2>/dev/null)
+	if [ "$(echo "$j" | jsonfilter -q -e '@.status')" = "success" ]; then
+		ip=$(echo "$j" | jsonfilter -q -e '@.query')
+		isp=$(echo "$j" | jsonfilter -q -e '@.isp')
+		[ -n "$isp" ] || isp=$(echo "$j" | jsonfilter -q -e '@.org')
+		city=$(echo "$j" | jsonfilter -q -e '@.city')
+		region=$(echo "$j" | jsonfilter -q -e '@.regionName')
+		country=$(echo "$j" | jsonfilter -q -e '@.countryCode')
+	else
+		j=$(curl -s --interface "$dev" --max-time 8 https://ipinfo.io/json 2>/dev/null)
+		ip=$(echo "$j" | jsonfilter -q -e '@.ip')
+		[ -n "$ip" ] || return 1
+		isp=$(echo "$j" | jsonfilter -q -e '@.org' | sed 's/^AS[0-9]* //')
+		city=$(echo "$j" | jsonfilter -q -e '@.city')
+		region=$(echo "$j" | jsonfilter -q -e '@.region')
+		country=$(echo "$j" | jsonfilter -q -e '@.country')
+	fi
+	printf '%s|%s|%s|%s|%s|%s|%s\n' "$w" "$ip" "$isp" "$city" "$region" "$country" "$(date +%s)"
+}
+
+cmd_geo() {
+	local force="$1" w line age now last
+	now=$(date +%s)
+	if [ "$force" != "force" ] && [ -s "$GEO_FILE" ]; then
+		last=$(awk -F'|' 'NR==1{print $7}' "$GEO_FILE")
+		age=$((now - ${last:-0}))
+		[ "$age" -lt "$GEO_MAX_AGE" ] && return 0
+	fi
+	collect_wans
+	local tmp="$GEO_FILE.$$"
+	: > "$tmp"
+	for w in $WANS; do
+		line=$(geo_one "$w") && echo "$line" >> "$tmp"
+	done
+	mv "$tmp" "$GEO_FILE"
+	cat "$GEO_FILE"
+}
+
+# ---------------------------------------------------------------- history
+# Small but useful over 90 days. We do NOT log every sample. A per-day
+# accumulator (ACC_FILE, in RAM) is updated each cycle in ONE awk pass;
+# hist_flush folds it into flash as one row per WAN per day and prunes to
+# HIST_DAYS. Result: a few hundred rows, a couple of KB, ~24 flash writes/day.
+#
+# Row schema (ACC_FILE and HIST_FILE), CSV:
+#   date,wan,up,down,rtt_sum,rtt_n,loss_sum,loss_n,outages,dl_sum,dl_n,dl_max,ul_sum,ul_n,ul_max
+# up/down = count of health samples seen online/offline (=> uptime %).
+
+# Fold the latest health OR speed results into today's accumulator rows.
+# One awk invocation; state/outage edges tracked via STATE_FILE.
+hist_rollup() {
+	local kind="$1" today
+	today=$(date +%Y-%m-%d)
+	[ -f "$ACC_FILE" ]   || : > "$ACC_FILE"
+	[ -f "$STATE_FILE" ] || : > "$STATE_FILE"
+
+	if [ "$kind" = "health" ] && [ -f "$HEALTH_FILE" ]; then
+		awk -F' ' -v d="$today" '
+			# 1) previous per-wan state
+			FILENAME==SF { st[$1]=$2; next }
+			# 2) todays accumulator rows (CSV)
+			FILENAME==AF {
+				split($0,c,","); if (c[1]==d) { for(i=3;i<=15;i++) A[c[2]","i]=c[i]; have[c[2]]=1 }
+				else keep[NR]=$0
+				next
+			}
+			# 3) health lines: wan rtt loss epoch
+			{
+				w=$1; rtt=$2; loss=$3; if(w=="")next
+				have[w]=1
+				if (loss=="100" || rtt=="-") {
+					A[w",4"]++                              # down
+					if (st[w]!="down") A[w",9"]++          # outage edge
+					st[w]="down"
+				} else {
+					A[w",3"]++                              # up
+					if (rtt!="-") { A[w",5"]+=rtt; A[w",6"]++ }
+					A[w",7"]+=loss+0; A[w",8"]++
+					st[w]="up"
+				}
+			}
+			END {
+				for (n in keep) print keep[n] > AO
+				for (w in have) {
+					line=d","w
+					for(i=3;i<=15;i++) line=line","(A[w","i]+0)
+					print line > AO
+				}
+				for (w in st) print w" "st[w] > SO
+			}
+		' SF="$STATE_FILE" AF="$ACC_FILE" AO="$ACC_FILE.$$" SO="$STATE_FILE.$$" \
+			"$STATE_FILE" "$ACC_FILE" "$HEALTH_FILE" >/dev/null 2>&1
+		[ -f "$ACC_FILE.$$" ] && mv "$ACC_FILE.$$" "$ACC_FILE"
+		[ -f "$STATE_FILE.$$" ] && mv "$STATE_FILE.$$" "$STATE_FILE"
+	fi
+
+	if [ "$kind" = "speed" ] && [ -f "$SPEED_FILE" ]; then
+		awk -F' ' -v d="$today" '
+			FILENAME==AF {
+				split($0,c,","); if (c[1]==d) { for(i=3;i<=15;i++) A[c[2]","i]=c[i]; have[c[2]]=1 }
+				else keep[NR]=$0
+				next
+			}
+			{
+				w=$1; dl=$2; ul=$3; stt=$4
+				if (w=="" || w ~ /^#/ || stt!="ok") next
+				have[w]=1
+				A[w",10"]+=dl; A[w",11"]++; if (dl+0>A[w",12"]+0) A[w",12"]=dl
+				A[w",13"]+=ul; A[w",14"]++; if (ul+0>A[w",15"]+0) A[w",15"]=ul
+			}
+			END {
+				for (n in keep) print keep[n] > AO
+				for (w in have) {
+					line=d","w
+					for(i=3;i<=15;i++) line=line","(A[w","i]+0)
+					print line > AO
+				}
+			}
+		' AF="$ACC_FILE" AO="$ACC_FILE.$$" "$ACC_FILE" "$SPEED_FILE" >/dev/null 2>&1
+		[ -f "$ACC_FILE.$$" ] && mv "$ACC_FILE.$$" "$ACC_FILE"
+	fi
+}
+
+# Merge the accumulator into flash, clear it, prune > HIST_DAYS. Called on a
+# cadence and on date change, so flash sees ~hourly writes at most.
+hist_flush() {
+	local cutoff
+	[ -s "$ACC_FILE" ] || return 0
+	mkdir -p "$HIST_DIR"
+	cutoff=$(date -d "-${HIST_DAYS} days" +%Y-%m-%d 2>/dev/null)
+	[ -f "$HIST_FILE" ] || : > "$HIST_FILE"
+	awk -F, '
+		FNR==NR { k=$1","$2; for(i=3;i<=15;i++) A[k","i]=$i; acc[k]=1; next }
+		{
+			k=$1","$2
+			if (k in acc) {
+				for(i=3;i<=15;i++) if (i==12||i==15) { if (A[k","i]>$i) $i=A[k","i] } else $i=$i+A[k","i]
+				done_[k]=1
+			}
+			print
+		}
+		END { for (k in acc) if (!(k in done_)) {
+			split(k,p,","); line=p[1]","p[2]; for(i=3;i<=15;i++) line=line","(A[k","i]+0); print line } }
+	' OFS=, "$ACC_FILE" "$HIST_FILE" | \
+		awk -F, -v c="$cutoff" '(c=="" || $1>=c)' | sort -t, -k1,1 -k2,2 > "$HIST_FILE.$$" \
+		&& mv "$HIST_FILE.$$" "$HIST_FILE"
+	: > "$ACC_FILE"
+}
+
+cmd_history() { cat "$HIST_FILE" 2>/dev/null; }
+
+
+# ----------------------------------------------------------------- checks
+cmd_check() {
+	local w dev gw ok=0 zone
+	collect_wans
+	echo "kmwan mode      : $(uci -q get kmwan.global.mode)"
+	echo "multikmwan enabled : $(g enabled 0)"
+	echo "table base      : $TABLE_BASE   rule base: $RULE_BASE"
+	echo ""
+	printf "%-8s %-7s %-16s %-7s %-7s %-8s %-9s %s\n" WAN DEV GATEWAY TABLE METRIC WEIGHT KMWAN METERED
+	for w in $WANS; do
+		dev=$(wan_dev "$w")
+		gw=$(wan_gw "$dev" | head -1)
+		printf "%-8s %-7s %-16s %-7s %-7s %-8s %-9s %s\n" \
+			"$w" "$dev" "${gw:--}" "$(wan_table "$w")" \
+			"$(uci -q get kmwan.$w.metric)" "$(uci -q get kmwan.$w.weight)" \
+			"$([ "$(uci -q get kmwan.$w.disabled)" = "1" ] && echo DISABLED || echo enabled)" \
+			"$(wan_metered "$w" && echo yes || echo no)"
+	done
+	echo ""
+	echo "NAT check (a client routed out an un-masqueraded WAN is blackholed):"
+	for w in $WANS; do
+		zone=$(uci show firewall 2>/dev/null | grep "\.network=.*'$w'" | cut -d. -f2 | head -1)
+		if [ -n "$zone" ]; then
+			if [ "$(uci -q get firewall.$zone.masq)" = "1" ] || \
+			   [ "$(uci -q get firewall.@zone[$(echo $zone | tr -dc 0-9)].masq)" = "1" ]; then
+				echo "  $w: masqueraded (zone $zone)  OK"
+			else
+				echo "  $w: zone $zone has masq != 1  CHECK"
+			fi
+		else
+			echo "  $w: no firewall zone found  CHECK"
+		fi
+		ok=$((ok + 1))
+	done
+	echo ""
+	echo "Active multikmwan rules:"
+	ip rule show | awk -F: -v lo="$RULE_BASE" -v hi="$RULE_MAX" '{pr=$1+0} pr>=lo && pr<=hi' || true
+	ip rule show | awk -F: -v lo="$RULE_BASE" -v hi="$RULE_MAX" '{pr=$1+0} pr>=lo && pr<=hi' | \
+		grep -q . || echo "  (none)"
+}
+
+cmd_status() {
+	collect_wans
+	echo "WANS: $WANS"
+	echo "--- kmwan ---"
+	cat /proc/gl-kmwan/status 2>/dev/null | head -40
+	echo "--- rules ---"
+	ip rule show
+	echo "--- speed ---"
+	cat "$SPEED_FILE" 2>/dev/null || echo "(no results)"
+	echo "--- health ---"
+	cat "$HEALTH_FILE" 2>/dev/null || echo "(no results)"
+	echo "--- geo ---"
+	cat "$GEO_FILE" 2>/dev/null || echo "(no results)"
+}
+
+case "$1" in
+	sync)      cmd_sync ;;
+	flush)     cmd_flush ;;
+	mode)      shift; cmd_mode "$@" ;;
+	speedtest) shift; cmd_speedtest "$@" ;;
+	rank)      shift; cmd_rank "$@" ;;
+	check)     cmd_check ;;
+	health)    cmd_health ;;
+	autorank)  cmd_autorank ;;
+	history)   cmd_history ;;
+	hist-flush) hist_flush ;;
+	loop)      cmd_loop ;;
+	geo)       shift; cmd_geo "$@" ;;
+	status)    cmd_status ;;
+	*)
+		cat <<USAGE
+multikmwan - per-client WAN preference + speed ranking for GL kmwan
+
+  multikmwan check                    show WANs, tables, NAT sanity, active rules
+  multikmwan sync                     apply client rules and per-WAN tables
+  multikmwan flush                    remove everything multikmwan installed
+  multikmwan mode [failover|balancing]  get/set kmwan mode
+  multikmwan speedtest [wan ...]      measure down/up per WAN (binds to each dev)
+  multikmwan rank [sum|down|up] [both|metric|weight]
+                                   apply last speed test to kmwan
+  multikmwan health                   ping latency/loss out of each WAN
+  multikmwan autorank                 re-test (small payload) and re-rank if the leader changed
+  multikmwan history                  print the 90-day daily history CSV
+  multikmwan geo [force]              public IP / ISP / location per WAN
+  multikmwan status                   kmwan status + rules + last speed results
+USAGE
+		;;
+esac

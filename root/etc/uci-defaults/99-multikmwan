@@ -1,0 +1,29 @@
+#!/bin/sh
+# Seed MultiKmwan defaults exactly once, WITHOUT ever clobbering existing
+# settings. Shipped as a uci-defaults script (not a conffile) on purpose: a
+# conffile is deleted by `opkg remove` and by `--force-reinstall`, which is how
+# settings used to get wiped. This runs on install, is idempotent, and removes
+# itself; on any later reinstall it sees the existing config and does nothing.
+[ -f /etc/config/multikmwan ] || touch /etc/config/multikmwan
+
+if [ -z "$(uci -q get multikmwan.global)" ]; then
+	uci -q batch <<'EOF'
+set multikmwan.global=global
+set multikmwan.global.enabled=0
+set multikmwan.global.table_base=200
+set multikmwan.global.rule_base=2000
+set multikmwan.global.interval=20
+set multikmwan.global.st_bytes=25000000
+set multikmwan.global.st_timeout=25
+set multikmwan.global.st_down_url=https://speed.cloudflare.com/__down?bytes={bytes}
+set multikmwan.global.st_up_url=https://speed.cloudflare.com/__up
+set multikmwan.global.active_server=
+set multikmwan.global.rank_by=sum
+set multikmwan.global.auto_rank=0
+set multikmwan.global.auto_bytes=10000000
+set multikmwan.global.auto_margin=15
+EOF
+	uci commit multikmwan
+fi
+
+exit 0

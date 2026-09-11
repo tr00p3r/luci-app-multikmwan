@@ -1,0 +1,8 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+/etc/init.d/multikmwan stop >/dev/null 2>&1
+/etc/init.d/multikmwan disable >/dev/null 2>&1
+/usr/sbin/multikmwan flush >/dev/null 2>&1
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+exit 0

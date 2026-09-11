@@ -1,0 +1,24 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+chmod +x /usr/sbin/multikmwan
+chmod +x /usr/libexec/rpcd/luci.multikmwan
+chmod +x /etc/init.d/multikmwan
+chmod +x /etc/hotplug.d/iface/95-multikmwan
+chmod +x /etc/uci-defaults/99-multikmwan 2>/dev/null
+# seed defaults now (and let it self-remove) so settings exist immediately
+[ -f /etc/uci-defaults/99-multikmwan ] && sh /etc/uci-defaults/99-multikmwan && rm -f /etc/uci-defaults/99-multikmwan
+rm -f /tmp/luci-indexcache* 2>/dev/null
+rm -rf /tmp/luci-modulecache 2>/dev/null
+/etc/init.d/rpcd restart >/dev/null 2>&1
+/etc/init.d/multikmwan enable >/dev/null 2>&1
+/etc/init.d/multikmwan start >/dev/null 2>&1
+echo ""
+echo "luci-app-multikmwan installed."
+echo "  UI:            Network -> MultiKmwan"
+echo "  Check setup:   multikmwan check"
+echo "  Apply rules:   multikmwan sync"
+echo "  Speed test:    multikmwan speedtest"
+echo ""
+echo "Background health/location probes are running (service: multikmwan)."
+echo ""
+exit 0

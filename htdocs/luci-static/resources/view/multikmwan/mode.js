@@ -7,6 +7,55 @@
 
 var callSetMode = rpc.declare({ object: 'luci.multikmwan', method: 'setmode',
                                 params: [ 'mode' ] });
+var callStServers = rpc.declare({ object: 'luci.multikmwan', method: 'stservers' });
+var callAddServer = rpc.declare({ object: 'luci.multikmwan', method: 'add_server',
+                                  params: [ 'label', 'down', 'up' ] });
+
+// Modal: fetch nearest speedtest.net servers and add the picked one as a
+// server profile. Each Ookla server speaks the classic HTTP protocol
+// (random*.jpg download + upload.php), which our fixed-file test handles.
+function browseSpeedtestNet() {
+	ui.showModal(_('Add a speedtest.net server'), [
+		E('p', { 'class': 'spinning' }, _('Finding nearby servers…'))
+	]);
+	callStServers().then(function(res) {
+		var servers = (res && res.servers) || [];
+		var rows = servers.map(function(sv) {
+			var title = sv.sponsor + ' — ' + sv.name +
+				(sv.cc ? ', ' + sv.cc : '') + (sv.dist ? '  (' + sv.dist + ' km)' : '');
+			return E('div', { 'style': 'display:flex;justify-content:space-between;' +
+				'align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid rgba(128,128,128,.15)' }, [
+				E('span', {}, title),
+				E('button', { 'class': 'cbi-button cbi-button-add',
+					'click': function() {
+						callAddServer(sv.sponsor + ' (' + sv.name + ')', sv.down, sv.up).then(function() {
+							ui.hideModal();
+							ui.addNotification(null, E('p', _('Added ') + sv.sponsor +
+								_('. It is now in the Speed-test server list.')), 'info');
+							window.setTimeout(function() { location.reload(); }, 800);
+						});
+					} }, _('Add'))
+			]);
+		});
+		if (!rows.length)
+			rows = [ E('p', {}, _('No servers returned. Check the router has internet.')) ];
+		ui.showModal(_('Add a speedtest.net server'), [
+			E('p', {}, _('Nearest servers to you. Add one, then pick it as the ' +
+				'Speed-test server above.')),
+			E('div', { 'style': 'max-height:50vh;overflow:auto' }, rows),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Close'))
+			])
+		]);
+	}).catch(function(e) {
+		ui.showModal(_('Add a speedtest.net server'), [
+			E('p', {}, _('Could not fetch the server list: ') + (e.message || e)),
+			E('div', { 'class': 'right' }, [
+				E('button', { 'class': 'cbi-button', 'click': ui.hideModal }, _('Close'))
+			])
+		]);
+	});
+}
 
 return view.extend({
 	load: function() { return Promise.all([ uci.load('kmwan'), uci.load('multikmwan') ]); },
@@ -120,9 +169,10 @@ return view.extend({
 
 		// --- your own speed-test servers ---
 		s = m.section(form.GridSection, 'server', _('Speed-test servers'),
-			_('Define your own servers here, then pick one above. {bytes} in the ' +
-			  'download URL is replaced with the test size; or use a fixed-size file ' +
-			  'and leave {bytes} out.'));
+			_('Define your own servers here, then pick one above. Use the ' +
+			  '"Browse speedtest.net" button to add a nearby Ookla server, or add ' +
+			  'one manually — {bytes} in the download URL is replaced with the test ' +
+			  'size, or point at a fixed-size file and leave {bytes} out.'));
 		s.addremove = true;
 		s.anonymous = false;
 		s.nodescriptions = true;
@@ -192,7 +242,20 @@ return view.extend({
 			_('Format: ping,1.1.1.1'));
 		o.modalonly = true;
 
-		return m.render();
+		// Inject a "Browse speedtest.net" button next to the server section's
+		// Add button once the map has rendered (reliable across LuCI versions).
+		return m.render().then(function(node) {
+			var creates = node.querySelectorAll('.cbi-section-create');
+			var host = creates.length ? creates[creates.length - 1] : null;
+			if (host) {
+				host.appendChild(E('button', {
+					'class': 'cbi-button cbi-button-action',
+					'style': 'margin-left:8px',
+					'click': function(ev) { ev.preventDefault(); browseSpeedtestNet(); }
+				}, _('Browse speedtest.net')));
+			}
+			return node;
+		});
 	},
 
 	handleSaveApply: function(ev) {

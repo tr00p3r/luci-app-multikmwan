@@ -265,12 +265,41 @@ clients_json() {
 	json_dump
 }
 
+# Nearest speedtest.net (Ookla) servers, ready to add as profiles. Each speaks
+# the classic HTTP protocol: download a random*.jpg, upload to upload.php.
+stservers_json() {
+	local list url base host i=0 n
+	list=$(curl -s --max-time 15 'https://www.speedtest.net/api/js/servers?engine=js&limit=25' 2>/dev/null)
+	json_init
+	json_add_array servers
+	while [ $i -lt 25 ]; do
+		url=$(echo "$list" | jsonfilter -q -e "@[$i].url")
+		[ -n "$url" ] || break
+		# base = the server's /speedtest/ dir; download file lives there too
+		base=${url%upload.php}
+		json_add_object ""
+		json_add_string id "$(echo "$list" | jsonfilter -q -e "@[$i].id")"
+		json_add_string sponsor "$(echo "$list" | jsonfilter -q -e "@[$i].sponsor")"
+		json_add_string name "$(echo "$list" | jsonfilter -q -e "@[$i].name")"
+		json_add_string cc "$(echo "$list" | jsonfilter -q -e "@[$i].cc")"
+		json_add_string dist "$(echo "$list" | jsonfilter -q -e "@[$i].distance")"
+		json_add_string down "${base}random4000x4000.jpg"
+		json_add_string up "$url"
+		json_close_object
+		i=$((i + 1))
+	done
+	json_close_array
+	json_dump
+}
+
 case "$1" in
 	list)
 		json_init
 		json_add_object "status";    json_close_object
 		json_add_object "clients";   json_close_object
 		json_add_object "history";   json_close_object
+		json_add_object "stservers"; json_close_object
+		json_add_object "add_server"; json_add_string "label" "str"; json_add_string "down" "str"; json_add_string "up" "str"; json_close_object
 		json_add_object "sync";      json_close_object
 		json_add_object "check";     json_close_object
 		json_add_object "speedtest"; json_close_object
@@ -285,6 +314,18 @@ case "$1" in
 			status)  wans_json ;;
 			clients) clients_json ;;
 			history) history_json ;;
+			stservers) stservers_json ;;
+			add_server)
+				read -r input
+				json_load "$input" 2>/dev/null
+				json_get_var label label; json_get_var down down; json_get_var up up
+				sid="st$(date +%s)"
+				uci set multikmwan."$sid"=server
+				uci set multikmwan."$sid".label="$label"
+				uci set multikmwan."$sid".down_url="$down"
+				[ -n "$up" ] && uci set multikmwan."$sid".up_url="$up"
+				uci commit multikmwan
+				json_init; json_add_string result "$sid"; json_dump ;;
 			sync)
 				json_init
 				json_add_string result "$(/usr/sbin/multikmwan sync 2>&1 | tail -3)"

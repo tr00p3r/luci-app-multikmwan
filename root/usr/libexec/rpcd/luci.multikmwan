@@ -161,6 +161,7 @@ wans_json() {
 		json_add_object ""
 		json_add_string label "$(uci -q get multikmwan.$cs.label)"
 		json_add_string src "$src"
+		json_add_string mode "$(uci -q get multikmwan.$cs.mode)"
 		json_add_string order "$(uci -q get multikmwan.$cs.order | tr '\n' ' ')"
 		json_add_string enabled "$(uci -q get multikmwan.$cs.enabled)"
 		json_add_boolean live "$(echo "$live_rules" | grep -q "from $src " && echo 1 || echo 0)"

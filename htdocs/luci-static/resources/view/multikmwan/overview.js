@@ -183,7 +183,9 @@ return view.extend({
 				_('No client rules configured. Add devices on the Client Preference page.'));
 
 		var prefOff = (d.enabled !== '1');
+		var roleLabel = { fastest: _('Fastest link'), slowest: _('Slowest link'), backup: _('Backup link') };
 		var rows = clients.map(function(c) {
+			var role = c.mode && c.mode !== 'order' ? c.mode : null;
 			var order = (c.order || '').trim().split(/\s+/).filter(Boolean);
 			var live = c.live && !prefOff;
 			var badge = c.enabled !== '1'
@@ -195,12 +197,14 @@ return view.extend({
 				E('span', { 'class': 'mk-pill mk-' + badge.cls }, badge.t),
 				E('b', {}, (c.label && c.label !== '') ? c.label : c.src),
 				E('span', { 'class': 'mk-dim' }, ' ' + c.src + '  →  '),
-				E('span', {}, order.map(function(w, i) {
-					return E('span', {}, [
-						E('span', { 'class': 'mk-dot',
-							'style': 'background:' + (wanColor[w] || '#888') }),
-						w + (i < order.length - 1 ? '  ›  ' : '') ]);
-				}))
+				role
+					? E('b', {}, roleLabel[role] || role)
+					: E('span', {}, order.map(function(w, i) {
+						return E('span', {}, [
+							E('span', { 'class': 'mk-dot',
+								'style': 'background:' + (wanColor[w] || '#888') }),
+							w + (i < order.length - 1 ? '  ›  ' : '') ]);
+					}))
 			]);
 		});
 		var note = prefOff

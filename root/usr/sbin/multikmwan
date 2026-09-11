@@ -113,6 +113,42 @@ flush_rules() {
 	done
 }
 
+# Non-metered WANs ordered by last measured download. dir=desc → fastest first,
+# asc → slowest first. Falls back to config order when there's no speed data.
+_wans_by_speed() {
+	local dir="$1" flag="-rn" w dl
+	[ "$dir" = "asc" ] && flag="-n"
+	if [ ! -f "$SPEED_FILE" ]; then collect_wans; echo "$WANS"; return; fi
+	{ awk '$1 !~ /^#/ && $4=="ok" {print $2" "$1}' "$SPEED_FILE" | \
+		while read -r dl w; do wan_metered "$w" || echo "$dl $w"; done | \
+		sort $flag | awk '{printf "%s ", $2}'; }
+}
+
+# Metered/backup links first, then everything else as fallback.
+_wans_backup_first() {
+	local w metered="" rest=""
+	collect_wans
+	for w in $WANS; do
+		if wan_metered "$w"; then metered="$metered $w"; else rest="$rest $w"; fi
+	done
+	echo "$metered $rest"
+}
+
+# Resolve a client's target into an ordered WAN list. "order" uses the
+# configured list; the role modes are recomputed each sync, so a "fastest"
+# client follows the best line as measurements change.
+_client_order() {
+	local s="$1" mode
+	config_get mode "$s" mode "order"
+	case "$mode" in
+		fastest) _wans_by_speed desc ;;
+		slowest) _wans_by_speed asc ;;
+		backup)  _wans_backup_first ;;
+		*)       config_get_x "$s" order ;;
+	esac
+}
+config_get_x() { local v; config_get v "$1" "$2" ""; echo "$v"; }
+
 PREF=0
 _client_cb() {
 	local s="$1" enabled src order w tbl
@@ -120,7 +156,7 @@ _client_cb() {
 	[ "$enabled" = 1 ] || return 0
 	config_get src "$s" src ""
 	[ -n "$src" ] || return 0
-	config_get order "$s" order ""
+	order=$(_client_order "$s")
 	[ -n "$order" ] || return 0
 	for w in $order; do
 		tbl=$(wan_table "$w") || continue
@@ -151,6 +187,7 @@ cmd_sync() {
 	sync_tables
 	sync_rules
 	log "sync complete: wans='$WANS' rules=$PREF"
+	return 0
 }
 
 ip_flush_tables() {

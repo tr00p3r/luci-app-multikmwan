@@ -1,6 +1,6 @@
-# MultiKwan
+# MultiKmwan
 
-**A LuCI web UI for GL.iNet's built-in multi-WAN engine (`kmwan`).** It lets you switch between failover, load-balance, and a "fastest" mode; give individual LAN devices a preferred WAN; speed-test each line (against a public server or your own) and auto-rank the fastest with hysteresis so it doesn't flap; flag metered links as backup-only; and keep 90 days of per-WAN uptime, outage and speed history — all by driving the stock `kmwan` module rather than replacing it, so nothing about your GL.iNet setup is forked or lost.
+**A LuCI web UI for GL.iNet's built-in multi-WAN engine (`kmwan`).** It lets you switch between failover, load-balance, and a "fastest" mode; give individual LAN devices a preferred WAN (a specific order, or a role that follows measurements: fastest, slowest, or backup); speed-test each line (against a public server or your own) and auto-rank the fastest with hysteresis so it doesn't flap; flag metered links as backup-only; and keep 90 days of per-WAN uptime, outage and speed history — all by driving the stock `kmwan` module rather than replacing it, so nothing about your GL.iNet setup is forked or lost.
 
 | Status & Speed | 90-Day History |
 |---|---|
@@ -15,11 +15,11 @@
 LuCI on GL.iNet is on **port 8080**. Download the `.ipk` from [Releases](../../releases):
 
 ```sh
-scp luci-app-multikwan_*.ipk root@192.168.8.1:/tmp/
-ssh root@192.168.8.1 "opkg install /tmp/luci-app-multikwan_*.ipk"
+scp luci-app-multikmwan_*.ipk root@192.168.8.1:/tmp/
+ssh root@192.168.8.1 "opkg install /tmp/luci-app-multikmwan_*.ipk"
 ```
 
-Then open **Network → MultiKwan**. Requires a GL.iNet 4.x device with `kmwan` and LuCI; the package is architecture-independent.
+Then open **Network → MultiKmwan**. Requires a GL.iNet 4.x device with `kmwan` and LuCI; the package is architecture-independent.
 
 **Tested on:** GL-AX1800 (Flint), OpenWrt 23.05 / GL SDK4, `kmwan` 5.4.164, with three wired WANs.
 

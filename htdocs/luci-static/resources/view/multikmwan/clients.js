@@ -61,8 +61,19 @@ return view.extend({
 			o.value(h.ip, nm + ' — ' + h.ip + (h.static ? '' : _(' (dynamic lease)')));
 		});
 
-		o = s.option(form.DynamicList, 'order', _('Use these WANs, in order'),
+		o = s.option(form.ListValue, 'mode', _('Use'),
+			_('Pick specific WANs, or a role that follows measurements: Fastest / ' +
+			  'Slowest track the latest speed test; Backup uses metered links first.'));
+		o.value('order', _('Specific WANs'));
+		o.value('fastest', _('Fastest link (auto)'));
+		o.value('slowest', _('Slowest link (auto)'));
+		o.value('backup', _('Backup link'));
+		o.default = 'order';
+		o.editable = true;
+
+		o = s.option(form.DynamicList, 'order', _('WAN order'),
 			_('First one that is up wins.'));
+		o.depends('mode', 'order');
 		var members = uci.sections('kmwan', 'member');
 		for (var i = 0; i < members.length; i++) {
 			var n = members[i]['.name'];

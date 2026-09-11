@@ -26,4 +26,17 @@ EOF
 	uci commit multikmwan
 fi
 
+# Seed a ready-made server profile so the picker isn't empty. Independent of
+# the global block above, so existing installs get it on upgrade too. Only
+# runs when there are no server profiles yet; never clobbers your own.
+if ! uci show multikmwan 2>/dev/null | grep -q '=server$'; then
+	uci -q batch <<'EOF'
+set multikmwan.cloudflare=server
+set multikmwan.cloudflare.label=Cloudflare
+set multikmwan.cloudflare.down_url=https://speed.cloudflare.com/__down?bytes={bytes}
+set multikmwan.cloudflare.up_url=https://speed.cloudflare.com/__up
+EOF
+	uci commit multikmwan
+fi
+
 exit 0

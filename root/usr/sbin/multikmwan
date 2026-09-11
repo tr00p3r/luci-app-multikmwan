@@ -228,6 +228,9 @@ st_one() {
 	[ -n "$dev" ] || { echo "$w 0 0 nodev"; return 0; }
 	bytes=${ST_BYTES:-$(g st_bytes 25000000)}
 	to=$(g st_timeout 25)
+	local streams dbytes
+	streams=$(g st_streams 4)
+	[ "$streams" -ge 1 ] 2>/dev/null || streams=4
 	# Active server profile (config server '<id>') wins; otherwise the inline
 	# custom URLs. Either way a profile's blank field falls back to the inline
 	# one, so you can define a download-only server.
@@ -241,24 +244,61 @@ st_one() {
 	[ -n "$url_u" ] || url_u=$(g st_up_url 'https://speed.cloudflare.com/__up')
 	# "{bytes}" is substituted; a URL ending in "=" gets the size appended
 	# (old config format); anything else is fetched as-is (fixed-size file).
+	# Divide the size across streams so total download ~= the configured size
+	# (each parallel stream fetches a fraction). Fixed-file servers ignore this.
+	dbytes=$((bytes / streams))
+	[ "$dbytes" -ge 1000000 ] || dbytes="$bytes"
 	case "$url_d" in
-		*"{bytes}"*) url_d=$(echo "$url_d" | sed "s/{bytes}/$bytes/g") ;;
-		*=)          url_d="${url_d}${bytes}" ;;
+		*"{bytes}"*) url_d=$(echo "$url_d" | sed "s/{bytes}/$dbytes/g") ;;
+		*=)          url_d="${url_d}${dbytes}" ;;
 	esac
 
-	bd=$(curl -s -o /dev/null --interface "$dev" --max-time "$to" \
-		-w '%{speed_download}' "$url_d" 2>/dev/null)
+	# Parallel connections. A single TCP stream can't fill a fast link over any
+	# real latency (bandwidth-delay product), so like every real speed test we
+	# open several at once and sum their rates. -L follows redirects (Ookla
+	# servers 307 http->their canonical https host, else they measure 0).
+	local tmpd i ub per
+	tmpd="/tmp/mkst.$w.$$"
+	rm -rf "$tmpd"; mkdir -p "$tmpd"
+
+	# --- parallel download: each stream reports its own speed, we sum them ---
+	i=1
+	while [ "$i" -le "$streams" ]; do
+		curl -sL -o /dev/null --interface "$dev" --max-time "$to" \
+			-w '%{speed_download}\n' "$url_d" > "$tmpd/d$i" 2>/dev/null &
+		i=$((i + 1))
+	done
+	wait
+	bd=$(cat "$tmpd"/d* 2>/dev/null | awk '{s += $1} END { printf "%.0f", s }')
 	[ -n "$bd" ] || bd=0
 
-	bu=$(dd if=/dev/zero bs=65536 count=$((bytes / 65536)) 2>/dev/null | \
-		curl -s -o /dev/null --interface "$dev" --max-time "$to" \
-		-H 'Content-Type: application/octet-stream' \
-		-w '%{speed_upload}' --data-binary @- "$url_u" 2>/dev/null)
+	# --- parallel upload of generated data (/dev/zero). Total buffered across
+	#     streams is capped so a big test size can't OOM the router (curl buffers
+	#     --data-binary); 50 MB total is ample to measure an uplink. ---
+	ub="$bytes"
+	[ "$ub" -gt 52428800 ] 2>/dev/null && ub=52428800
+	per=$((ub / streams))
+	[ "$per" -ge 65536 ] || per=65536
+	i=1
+	while [ "$i" -le "$streams" ]; do
+		dd if=/dev/zero bs=65536 count=$((per / 65536)) 2>/dev/null | \
+			curl -sL -o /dev/null --interface "$dev" --max-time "$to" \
+			-H 'Content-Type: application/octet-stream' \
+			-w '%{speed_upload}\n' --data-binary @- "$url_u" > "$tmpd/u$i" 2>/dev/null &
+		i=$((i + 1))
+	done
+	wait
+	bu=$(cat "$tmpd"/u* 2>/dev/null | awk '{s += $1} END { printf "%.0f", s }')
 	[ -n "$bu" ] || bu=0
+	rm -rf "$tmpd"
 
 	dl=$(awk -v b="$bd" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
 	ul=$(awk -v b="$bu" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
-	echo "$w $dl $ul ok"
+	# A download of 0 means the server was unreachable/blocked: flag it so the
+	# UI shows "failed" instead of a misleading "0 Mbps ok".
+	local stt=ok
+	awk -v b="$bd" 'BEGIN{ exit !(b+0 <= 0) }' && stt=fail
+	echo "$w $dl $ul $stt"
 }
 
 cmd_speedtest() {

@@ -193,6 +193,13 @@ return view.extend({
 		o.datatype = 'range(5,300)';
 		mkopt('st_timeout', '25');
 
+		o = s.option(form.ListValue, '_st_streams', _('Parallel streams'),
+			_('Simultaneous connections per test. A single stream cannot fill a ' +
+			  'fast link over real latency, so raise this for accurate results on ' +
+			  'fast lines or distant servers (like real speed tests do).'));
+		[ 1, 2, 4, 8, 16 ].forEach(function(n) { o.value(String(n), String(n)); });
+		mkopt('st_streams', '4');
+
 		// --- your own speed-test servers (separate map: profiles live in the
 		//     multikmwan config, not kmwan, so the grid must bind to it) ---
 		var m2 = new form.Map('multikmwan');

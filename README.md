@@ -2,13 +2,17 @@
 
 **A LuCI web UI for GL.iNet's built-in multi-WAN engine (`kmwan`).** It lets you switch between failover, load-balance, and a "fastest" mode; give individual LAN devices a preferred WAN (a specific order, or a role that follows measurements: fastest, slowest, or backup); speed-test each line (against a public server or your own), time DNS lookups and real page loads over each line, and auto-rank the best with hysteresis so it doesn't flap; flag metered links as backup-only; and keep 90 days of per-WAN uptime, outage and speed history — all by driving the stock `kmwan` module rather than replacing it, so nothing about your GL.iNet setup is forked or lost.
 
-| Status | History |
+| Status | Quality |
 |---|---|
-| ![Status](screenshots/status.png) | ![History](screenshots/history.png) |
+| ![Status](screenshots/status.png) | ![Quality](screenshots/quality.png) |
 
 | Settings | Devices |
 |---|---|
-| ![Mode](screenshots/mode.png) | ![Clients](screenshots/clients.png) |
+| ![Settings](screenshots/mode.png) | ![Devices](screenshots/clients.png) |
+
+| History | |
+|---|---|
+| ![History](screenshots/history.png) | |
 
 ## Install
 

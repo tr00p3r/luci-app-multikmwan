@@ -69,7 +69,10 @@ return view.extend({
 	load: function() { return callQuality(24); },
 	renderData: function(data) {
 		if (data.error) return E('p', { role: 'alert' }, data.error);
-		var cards = (data.wans || []).sort(function(a, b) { return a.name.localeCompare(b.name); }).map(function(w) {
+		// Links disabled in kmwan are not tracked: no card, one footnote (as on Status).
+		var hidden = (data.wans || []).filter(function(w) { return w.state === 'disabled'; }).map(function(w) { return w.name; }).sort();
+		var cards = (data.wans || []).filter(function(w) { return w.state !== 'disabled'; })
+			.sort(function(a, b) { return a.name.localeCompare(b.name); }).map(function(w) {
 			var age = Math.max(0, data.now - w.epoch), latest = w.points[w.points.length - 1];
 			return E('section', { 'class': 'mq-card' }, [
 				E('div', { 'class': 'mq-heading' }, [ E('h3', {}, w.name),
@@ -86,6 +89,7 @@ return view.extend({
 			]);
 		});
 		if (!cards.length) cards.push(E('p', {}, _('No observations yet. The background monitor will populate this page.')));
+		if (hidden.length) cards.push(E('p', { 'class': 'mq-note' }, _('Not shown (disabled in kmwan): ') + hidden.join(', ') + '.'));
 		var rows = (data.events || []).map(function(e) {
 			return E('tr', {}, [ E('td', {}, when(e[0])), E('td', {}, e[1]),
 				E('td', {}, EVENTS[e[2]] || e[2]), E('td', {}, REASONS[e[5]] || e[5]),

@@ -93,7 +93,7 @@ return view.extend({
 
 		var body = E('div', {}, [
 			E('style', {}, CSS),
-			E('h2', {}, _('90-Day History')),
+			multikmwan.topbar(_('90-Day History')),
 			E('p', {}, _('Rolled up one row per WAN per day and kept for 90 days. ' +
 				'Uptime is the share of health checks that answered; speeds are from ' +
 				'the periodic tests.'))

@@ -228,10 +228,10 @@ return view.extend({
 			if (w.city) where.push(w.city + (w.country ? ', ' + w.country : ''));
 
 			var meta = [
-				E('div', { 'class': 'mk-geo' }, w.pubip
+				E('div', { 'class': 'mk-geo mk-private' }, w.pubip
 					? [ E('b', {}, w.pubip), '   ' + where.join('  ·  ') ]
 					: E('span', { 'class': 'mk-dim' }, _('location not looked up yet'))),
-				E('div', { 'class': 'mk-dim' }, (w.device || '?') + '  ·  ' +
+				E('div', { 'class': 'mk-dim mk-private' }, (w.device || '?') + '  ·  ' +
 					(w.gateway ? 'gw ' + w.gateway : _('no gateway')) +
 					(w.link ? '  ·  ' + _('up ') + dur(w.uptime) : ''))
 			];
@@ -316,8 +316,8 @@ return view.extend({
 				                     : { t: _('pending'), cls: 'mk-warn' }));
 			return E('div', { 'class': 'mk-client' }, [
 				E('span', { 'class': 'mk-pill mk-' + badge.cls }, badge.t),
-				E('b', {}, (c.label && c.label !== '') ? c.label : c.src),
-				E('span', { 'class': 'mk-dim' }, ' ' + c.src + '  →  '),
+				E('b', { 'class': 'mk-private' }, (c.label && c.label !== '') ? c.label : c.src),
+				E('span', { 'class': 'mk-dim mk-private' }, ' ' + c.src + '  →  '),
 				role
 					? E('b', {}, roleLabel[role] || role)
 					: E('span', {}, order.map(function(w, i) {
@@ -634,7 +634,7 @@ return view.extend({
 
 		var body = E('div', {}, [
 			E('style', {}, CSS),
-			E('h2', {}, _('MultiKmwan')),
+			multikmwan.topbar(_('MultiKmwan')),
 			E('div', { 'class': 'mk-mode', 'id': 'mk-mode' }, this.modeText(d)),
 			E('h3', {}, _('Which line loads the internet faster?')),
 			E('div', { 'id': 'mk-ranking' }, this.renderRanking(d)),

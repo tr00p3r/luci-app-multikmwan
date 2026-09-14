@@ -4,6 +4,7 @@
 'require uci';
 'require rpc';
 'require ui';
+'require multikmwan';
 
 var callSetMode = rpc.declare({ object: 'luci.multikmwan', method: 'setmode',
                                 params: [ 'mode' ] });
@@ -387,7 +388,7 @@ return view.extend({
 					'style': 'margin-left:8px',
 					'click': function(ev) { ev.preventDefault(); browseSpeedtestNet(); }
 				}, _('Browse speedtest.net')));
-			return E('div', {}, nodes);
+			return E('div', {}, [ E('div', { 'class': 'right' }, multikmwan.privacyButton()) ].concat(nodes));
 		});
 	},
 

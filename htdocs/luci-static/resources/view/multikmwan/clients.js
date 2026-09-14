@@ -4,6 +4,7 @@
 'require uci';
 'require rpc';
 'require ui';
+'require multikmwan';
 
 var callSync    = rpc.declare({ object: 'luci.multikmwan', method: 'sync' });
 var callClients = rpc.declare({ object: 'luci.multikmwan', method: 'clients' });
@@ -95,7 +96,9 @@ return view.extend({
 		o.cfgvalue = function() { return uci.get('multikmwan', 'global', 'interval'); };
 		o.write = function(sid, v) { uci.set('multikmwan', 'global', 'interval', v); };
 
-		return m.render();
+		return m.render().then(function(node) {
+			return E('div', {}, [ E('div', { 'class': 'right' }, multikmwan.privacyButton()), node ]);
+		});
 	},
 
 	// handleSave() only STAGES changes in /tmp/.uci; uci.apply() is what

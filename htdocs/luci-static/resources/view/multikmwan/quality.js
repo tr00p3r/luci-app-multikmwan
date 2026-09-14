@@ -3,6 +3,7 @@
 'require rpc';
 'require poll';
 'require ui';
+'require multikmwan';
 
 var callQuality = rpc.declare({ object: 'luci.multikmwan', method: 'quality', params: ['hours'] });
 var CSS = '.mq-card{border:1px solid rgba(128,128,128,.3);border-radius:8px;padding:16px;margin:16px 0}' +
@@ -116,7 +117,7 @@ return view.extend({
 			self.hours = Number(ev.target.value); refresh();
 		} }, [ E('option', { value: '1' }, _('Last hour')), E('option', { value: '24', selected: true }, _('Last 24 hours')) ]);
 		poll.add(refresh, 10);
-		return E('div', {}, [ E('style', {}, CSS), E('div', { 'class': 'mq-heading' }, [E('h2', {}, _('Quality & Events')), select]),
+		return E('div', {}, [ E('style', {}, CSS), multikmwan.topbar(_('Quality & Events'), select),
 			E('p', {}, _('Continuous WAN monitoring. Green: responsive · Amber: degraded · Red: unresponsive · Empty: unknown.')),
 			E('p', { 'class': 'mq-note' }, _('Coverage is the observed fraction of the selected window. Sampling gaps are excluded. Recent detail is kept in bounded RAM for up to 24 hours and resets on reboot; daily totals remain in 90-day History. Jitter is the mean RTT change between consecutive replies in a probe batch.')),
 			status, content ]);

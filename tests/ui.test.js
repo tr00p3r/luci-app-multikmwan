@@ -182,6 +182,17 @@ test('progress and carried-forward results are visible on the page', () => {
 	assert.doesNotMatch(overview.renderWans(TWO).textContent, /previous result/);
 });
 
+test('privacy mode marks the sensitive bits and is off outside a browser', () => {
+	assert.equal(shared.privacyOn(), false);
+	assert.match(shared.privacyButton().textContent, /Privacy: off/);
+	assert.match(shared.topbar('MultiKmwan').textContent, /^MultiKmwan.*Privacy: off$/);
+	function classes(n, out) { if (n instanceof Element) { if (n.attrs['class']) out.push(n.attrs['class']); n.children.forEach(c => classes(c, out)); } return out; }
+	const cards = classes(overview.renderWans(TWO), []).filter(c => /mk-private/.test(c));
+	assert.equal(cards.length, 4);   // address+ISP line and device+gateway line, two cards
+	const rules = classes(overview.renderRules({ enabled: '1', wans: [], clients: [{ src: '192.168.0.9', label: 'Laptop', mode: 'fastest', enabled: '1', live: true }] }), []);
+	assert.equal(rules.filter(c => /mk-private/.test(c)).length, 2);
+});
+
 test('mode and source lines stay short', () => {
 	assert.equal(overview.modeText({ now: 1000, mode: 'failover', enabled: '1',
 		autorank: { interval: '15', epoch: '700', decision: 'same-leader' } }),

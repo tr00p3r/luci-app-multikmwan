@@ -449,6 +449,37 @@ grep -c 'stderr' curl.log
         self.assertIn(',wan,32.00,16.00,ok,manual,Facebook (real content),facebook,cdn.example,speed.cloudflare.com,ok,ok', output)
         self.assertTrue(output.strip().endswith('2'), output)  # one phase-2 call per stream
 
+    def test_website_test_measures_real_content_for_every_page_profile(self):
+        html = self.file('page.html', self.PAGE_HTML)
+        output = self.shell(f'''
+collect_wans() {{ WANS=wan; }}
+g() {{ case "$1" in st_bytes) echo 4000000;; st_streams) echo 2;; busy_skip) echo 0;; *) echo "$2";; esac; }}
+uci() {{ case "$*" in
+    "show multikmwan") printf "multikmwan.cf=server\\nmultikmwan.cf.kind='file'\\nmultikmwan.facebook=server\\nmultikmwan.facebook.kind='page'\\nmultikmwan.facebook.down_url='https://page.example/'\\n";;
+    *facebook.down_url) echo 'https://page.example/';; esac; }}
+wan_metered() {{ return 1; }}
+wan_dev() {{ echo eth0; }}
+log() {{ :; }}
+jsonfilter() {{ :; }}
+curl() {{
+    local out='' fmt='' prev='' a urls=''
+    for a in "$@"; do
+        case "$prev" in -o) out="$a";; -w) fmt="$a";; esac
+        case "$a" in http://*|https://*) urls="$urls $a";; esac
+        prev="$a"
+    done
+    case "$urls" in *page.example*) cp {html} "$out"; return 0;; esac
+    case "$fmt" in
+        '%{{stderr}}'*) for a in $urls; do echo "1000000 200 0.5 $a" >&2; done;;
+        *) echo "1000000 200 0.5 ${{urls# }}";;
+    esac
+}}
+cmd_webtest >/dev/null; cat "$CONTENT_FILE"
+''')
+        # Only the "page" profile is measured: 2 streams x 2 MB / 1 s = 32 Mbps.
+        self.assertRegex(output, r'(?m)^wan facebook 32.00 ok cdn.example \d+$')
+        self.assertNotIn(' cf ', output)
+
     def test_page_profile_without_assets_fails_loudly(self):
         html = self.file('page.html', '<html>no assets here</html>')
         output = self.shell(f'''

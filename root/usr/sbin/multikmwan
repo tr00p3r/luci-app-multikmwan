@@ -10,6 +10,7 @@ AUTO_FILE=/tmp/multikmwan.autorank
 SPEEDHIST_FILE=/tmp/multikmwan.speedhist
 WEB_FILE=/tmp/multikmwan.web
 WEBSITES_FILE=/tmp/multikmwan.websites
+CONTENT_FILE=/tmp/multikmwan.content
 # Persistent 90-day history lives on flash. Kept tiny: one rolled-up row per
 # WAN per day, flushed at most hourly, pruned to HIST_DAYS. An in-RAM
 # accumulator absorbs the frequent samples so flash is barely touched.
@@ -682,7 +683,7 @@ cmd_webtest() (
 
 _cmd_webtest() {
 	local targets="$*" w explicit=1 guard thr dev busy to sites line now
-	local tmpw="$WEB_FILE.$$" tmps="$WEBSITES_FILE.$$"
+	local tmpw="$WEB_FILE.$$" tmps="$WEBSITES_FILE.$$" tmpc="$CONTENT_FILE.$$"
 	collect_wans
 	[ -n "$targets" ] || { targets="$WANS"; explicit=0; }
 	guard=$(g busy_skip 1); thr=$(g busy_mbps 20)
@@ -690,6 +691,7 @@ _cmd_webtest() {
 	DNS_URL=$(g dns_url "$WEB_DEFAULT_DNS")
 	echo "# wan dns_ms first_byte_ms page_ms ok total status epoch" > "$tmpw"
 	echo "# wan host dns_ms first_byte_ms page_ms http status epoch" > "$tmps"
+	echo "# wan profile down_mbps status host epoch" > "$tmpc"
 	for w in $targets; do
 		now=$(date +%s)
 		[ "$explicit" = 1 ] || ! wan_disabled "$w" || continue
@@ -705,7 +707,7 @@ _cmd_webtest() {
 			if awk -v x="$busy" -v t="$thr" 'BEGIN{ exit !(x+0 > t+0) }'; then
 				# Response times on a loaded link describe the load, not the
 				# link. Carry the last result forward, as the speed test does.
-				web_keep "$w" "$tmpw" "$tmps" "$w - - - 0 0 busy $now"
+				web_keep "$w" "$tmpw" "$tmps" "$tmpc" "$w - - - 0 0 busy $now"
 				log "webtest: $w busy (${busy} Mbps in use > ${thr}) - skipped"
 				continue
 			fi
@@ -714,27 +716,65 @@ _cmd_webtest() {
 		line=$(web_wan "$w" "$dev" "$to" "$sites" "$tmps")
 		echo "$line" >> "$tmpw"
 		log "webtest: $line"
+		web_content "$w" "$dev" "$tmpc"
 	done
 	# A run naming specific WANs must not erase the others' results.
 	if [ "$explicit" = 1 ]; then
 		for w in $WANS; do
 			case " $targets " in *" $w "*) continue ;; esac
-			web_keep "$w" "$tmpw" "$tmps" ''
+			web_keep "$w" "$tmpw" "$tmps" "$tmpc" ''
 		done
 	fi
 	mv "$tmpw" "$WEB_FILE"
 	mv "$tmps" "$WEBSITES_FILE"
+	mv "$tmpc" "$CONTENT_FILE"
 	cat "$WEB_FILE"
 }
 
-# Copy a WAN's previous summary and site rows into the files being built;
-# $4 is written instead when there is no previous summary (may be empty).
+# Copy a WAN's previous summary, site and content rows into the files being
+# built; $5 is written instead when there is no previous summary (may be empty).
 web_keep() {
-	local w="$1" tmpw="$2" tmps="$3" fallback="$4" prior
+	local w="$1" tmpw="$2" tmps="$3" tmpc="$4" fallback="$5" prior
 	prior=$(grep "^$w " "$WEB_FILE" 2>/dev/null | head -1)
 	if [ -n "$prior" ]; then echo "$prior" >> "$tmpw"
 	elif [ -n "$fallback" ]; then echo "$fallback" >> "$tmpw"; fi
 	grep "^$w " "$WEBSITES_FILE" 2>/dev/null >> "$tmps"
+	grep "^$w " "$CONTENT_FILE" 2>/dev/null >> "$tmpc"
+}
+
+# Server profiles of kind "page" (Facebook by default): ids, one per line.
+content_profiles() {
+	uci show multikmwan 2>/dev/null | sed -n "s/^multikmwan\.\([A-Za-z0-9_]*\)\.kind='page'$/\1/p"
+}
+
+# Real-content throughput out of one WAN for every "page" profile, whether
+# or not one of them is the active speed-test server: this is what answers
+# "which line loads Facebook faster" on the Status page. Same machinery as
+# the speed test (st_page_download + st_validate), same size and stream
+# settings; ST_BYTES from auto-rank keeps scheduled runs small. Appends
+# rows "wan profile down_mbps status host epoch" to $3.
+web_content() {
+	local w="$1" dev="$2" out="$3" p url bytes streams to tmpd bd dl st host now
+	bytes=${ST_BYTES:-$(g st_bytes 25000000)}
+	streams=$(g st_streams 4)
+	[ "$streams" -ge 1 ] 2>/dev/null || streams=4
+	[ "$streams" -le 8 ] 2>/dev/null || streams=8
+	to=$(g st_timeout 25)
+	[ "$to" -ge 1 ] 2>/dev/null && [ "$to" -le 120 ] 2>/dev/null || to=25
+	for p in $(content_profiles); do
+		url=$(uci -q get multikmwan."$p".down_url)
+		case "$url" in http://*|https://*) ;; *) continue ;; esac
+		tmpd="/tmp/mkct.$w.$$"
+		rm -rf "$tmpd"; mkdir -p "$tmpd"
+		now=$(date +%s)
+		st_page_download "$dev" "$url" "$bytes" "$streams" "$to" "$tmpd"
+		bd=$(st_validate "$tmpd" d "$streams")
+		st=$(cat "$tmpd/dstatus"); host=$(cat "$tmpd/dhosts")
+		rm -rf "$tmpd"
+		dl=$(awk -v b="${bd:-0}" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
+		echo "$w $p $dl $st ${host:-$(st_host "$url")} $now" >> "$out"
+		log "webtest: $w $p ${dl} Mbps ($st)"
+	done
 }
 
 # Mean ping round trip per WAN over the last $1 seconds, from the monitor's
@@ -871,7 +911,7 @@ cmd_autorank() {
 	ST_BYTES="$bytes" ST_KIND=scheduled cmd_speedtest >/dev/null 2>&1 || return 1
 	# The composite needs fresh page and DNS figures too. The speed test has
 	# just released the shared lock, so this cannot collide with it.
-	[ "$(g rank_mode score)" != "score" ] || cmd_webtest >/dev/null 2>&1 || \
+	[ "$(g rank_mode score)" != "score" ] || ST_BYTES="$bytes" cmd_webtest >/dev/null 2>&1 || \
 		log "autorank: website test did not run; using its previous result"
 	sorted=$(rank_sorted "$by")
 	if [ -z "$sorted" ]; then

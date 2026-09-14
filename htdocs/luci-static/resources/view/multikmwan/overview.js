@@ -14,12 +14,13 @@ var callHealth = rpc.declare({ object: 'luci.multikmwan', method: 'health' });
 var callRank   = rpc.declare({ object: 'luci.multikmwan', method: 'rank',
                                params: [ 'by', 'what' ] });
 
+// The page reads top-down: a verdict in words, one comparison table, then
+// the per-link cards. Raw measurements live in tooltips and collapsed
+// sections so the first screen stays readable.
 var CSS = '' +
 '.mk-grid{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:1.2em}' +
 '.mk-card{flex:1 1 280px;border:1px solid rgba(128,128,128,.3);border-left-width:5px;' +
 'border-radius:8px;padding:13px 16px;background:rgba(128,128,128,.05)}' +
-'.mk-card.b-ok{border-left-color:#1f8b4c}.mk-card.b-warn{border-left-color:#d9a400}' +
-'.mk-card.b-down{border-left-color:#b3312c}.mk-card.b-idle{border-left-color:#8a8a8a}' +
 '.mk-card h4{margin:0 0 6px 0;font-size:1.05em;display:flex;' +
 'justify-content:space-between;align-items:center;gap:8px}' +
 '.mk-pill{font-size:.7em;font-weight:600;padding:2px 9px;border-radius:10px;' +
@@ -35,14 +36,12 @@ var CSS = '' +
 'letter-spacing:.05em;opacity:.6}' +
 '.mk-stat b{font-size:1.05em;font-weight:600}' +
 '.mk-stat.mk-score b{font-size:1.25em}' +
-'.mk-sites td,.mk-sites th{white-space:nowrap}' +
-'.mk-speed{font-size:.88em;display:flex;gap:12px;align-items:baseline;margin-top:4px}' +
+'.mk-speed{font-size:.88em;display:flex;gap:12px;align-items:baseline;margin-top:4px;flex-wrap:wrap}' +
 '.mk-speed b{font-weight:600}' +
 '.mk-dim{opacity:.55;font-size:.9em}' +
 '.mk-bar{height:6px;border-radius:4px;background:rgba(128,128,128,.25);' +
 'margin-top:7px;overflow:hidden}.mk-bar span{display:block;height:100%;background:#2a6fb5}' +
 '.mk-foot{font-size:.78em;opacity:.6;margin-top:7px}' +
-'.mk-rules{font-family:monospace;font-size:.85em;line-height:1.7}' +
 '.mk-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px;vertical-align:middle}' +
 '.mk-clients{display:flex;flex-direction:column;gap:6px}' +
 '.mk-client{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:.9em}' +
@@ -53,7 +52,13 @@ var CSS = '' +
 '.mk-legend span{display:inline-flex;align-items:center;gap:5px}' +
 '.mk-swatch{width:11px;height:11px;border-radius:2px;display:inline-block}' +
 '.mk-actions{display:flex;flex-wrap:wrap;gap:8px;margin:.8em 0 1.2em 0}' +
-'.mk-mode{font-size:.9em;margin-bottom:.8em;opacity:.85}';
+'.mk-mode{font-size:.9em;margin-bottom:.8em;opacity:.85}' +
+'.mk-rank td,.mk-rank th,.mk-sites td,.mk-sites th{white-space:nowrap}' +
+'.mk-lead{color:#1f8b4c;font-weight:600}' +
+'.mk-verdict{font-size:1.05em;margin:.2em 0 .8em 0}' +
+'.mk-list{list-style:none;padding:0;margin:.4em 0 .8em 0;font-size:.95em;line-height:1.8}' +
+'.mk-list b{font-weight:600}' +
+'details.mk-more{margin:.6em 0 1.2em 0}details.mk-more summary{cursor:pointer;opacity:.7;font-size:.9em}';
 
 // previous byte counters per WAN, for live throughput between polls
 var prev = {};
@@ -61,27 +66,45 @@ var prev = {};
 function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
 function fmt1(v) { var n = num(v); return n === null ? '-' : n.toFixed(1); }
 function fmtMs(v) { var n = num(v); return n === null ? '-' : String(Math.round(n)); }
-
-// The composite is on unless the user picked "Throughput only".
-function compositeOn(d) { return !d.rank || d.rank.mode !== 'speed'; }
-
-// Tooltip spelling out how a WAN's score was built, e.g.
-// "throughput 0.85 x 50% + website 1.00 x 30% + DNS 0.70 x 20%".
-function scoreTitle(sc, rank) {
-	var r = rank || {};
-	function part(label, pts, w) { return label + ' ' + (num(pts) === null ? '-' : num(pts).toFixed(2)) + ' \u00d7 ' + (w || '?') + '%'; }
-	return part(_('throughput'), sc.speed_pts, r.w_speed) + ' + ' +
-		part(_('website'), sc.web_pts, r.w_web) + ' + ' + part(_('latency'), sc.lat_pts, r.w_latency) +
-		' + ' + part(_('DNS'), sc.dns_pts, r.w_dns) +
-		(num(sc.sites) ? '  (' + sc.sites + _(' sites compared') + ')' : '') +
-		(num(sc.latency) !== null ? '  ' + _('ping ') + fmtMs(sc.latency) + ' ms' : '');
-}
 // Speeds: whole numbers at 10 Mbps and up, one decimal below 10.
 function fmtSpeed(v) {
 	var n = num(v);
 	if (n === null) return '-';
 	return n >= 10 ? String(Math.round(n)) : n.toFixed(1);
 }
+
+// The composite is on unless the user picked "Throughput only".
+function compositeOn(d) { return !d.rank || d.rank.mode !== 'speed'; }
+
+// Tooltip spelling out how a link's score was built.
+function scoreTitle(sc, rank) {
+	var r = rank || {};
+	function part(label, pts, w) { return label + ' ' + (num(pts) === null ? '-' : num(pts).toFixed(2)) + ' × ' + (w || '?') + '%'; }
+	return part(_('throughput'), sc.speed_pts, r.w_speed) + ' + ' +
+		part(_('websites'), sc.web_pts, r.w_web) + ' + ' + part(_('latency'), sc.lat_pts, r.w_latency) +
+		' + ' + part(_('DNS'), sc.dns_pts, r.w_dns) +
+		(num(sc.sites) ? '  (' + sc.sites + _(' sites compared') + ')' : '') +
+		(num(sc.latency) !== null ? '  ' + _('ping ') + fmtMs(sc.latency) + ' ms' : '');
+}
+
+// How a value compares with the column's best, in words: "12% slower".
+// Differences under 2% read as "about the same" so noise is not a verdict.
+function slower(v, best, lower) {
+	if (v === null || best === null || best <= 0) return '-';
+	var pct = lower ? (v - best) / best * 100 : (best - v) / best * 100;
+	if (pct < 2) return _('about the same');
+	return Math.round(pct) + _('% slower');
+}
+
+// Friendly site names for the lines under the table.
+function siteName(host) {
+	var h = String(host || '').replace(/^www\./, '');
+	var known = { 'facebook.com': 'Facebook', 'youtube.com': 'YouTube', 'drive.google.com': 'Google Drive',
+		'reddit.com': 'Reddit', 'google.com': 'Google', 'netflix.com': 'Netflix', 'twitter.com': 'Twitter', 'x.com': 'X' };
+	return known[h] || h;
+}
+// "Facebook (real content)" -> "Facebook".
+function shortLabel(label, fallback) { return String(label || fallback || '').replace(/\s*\(.*$/, ''); }
 
 function ago(epoch, now) {
 	var e = num(epoch);
@@ -124,43 +147,53 @@ function grade(w, now, interval) {
 	return { cls: 'ok', label: _('healthy'), note: '' };
 }
 
+// Real-content rows (Facebook and any other "page" profile) grouped as
+// profiles[] in first-seen order and by[wan][profile].
+function contentIndex(d) {
+	var profiles = [], seen = {}, by = {};
+	(d.content || []).forEach(function(r) {
+		if (!seen[r.profile]) { seen[r.profile] = true; profiles.push({ id: r.profile, label: shortLabel(r.label, r.profile) }); }
+		(by[r.name] = by[r.name] || {})[r.profile] = r;
+	});
+	return { profiles: profiles, by: by };
+}
+
 return view.extend({
 	load: function() { return callStatus(); },
 
 	renderWans: function(d) {
 		var now = num(d.now) || Math.floor(Date.now() / 1000);
 		var tnow = Date.now() / 1000;
-		var speeds = {}, maxd = 0, webs = {}, scores = {}, composite = compositeOn(d);
+		var speeds = {}, maxd = 0, webs = {}, scores = {}, composite = compositeOn(d), content = contentIndex(d);
 		(d.speed || []).forEach(function(s) {
-			s.source = (d.testhistory || []).filter(function(t) { return t.wan === s.name && t.epoch === s.epoch; }).pop();
 			speeds[s.name] = s;
 			if (s.status === 'ok') maxd = Math.max(maxd, num(s.down) || 0);
 		});
 		(d.web || []).forEach(function(x) { webs[x.name] = x; });
 		(d.scores || []).forEach(function(x) { scores[x.name] = x; });
 
+		// Links disabled in kmwan are not tracked, tested or routed to: no card.
 		var hidden = (d.wans || []).filter(function(w) { return w.disabled === '1'; }).map(function(w) { return w.name; });
 		var grid = E('div', { 'class': 'mk-grid' }, (d.wans || []).filter(function(w) { return w.disabled !== '1'; }).map(function(w) {
 			w.mode = d.mode;
 			var g  = grade(w, now, num(d.health_interval) || 20);
 			var sp = speeds[w.name], spNote = null;
 			if (sp && sp.status !== 'ok') {
-				spNote = (sp.status === 'metered') ? _('metered - not speed tested') : _('last speed test failed');
+				spNote = (sp.status === 'metered') ? _('metered: not speed-tested') : _('last speed test failed');
 				sp = null;
 			}
-			if (!spNote) spNote = (w.metered === '1') ? _('metered - not speed tested') : _('no speed test yet');
+			if (!spNote) spNote = (w.metered === '1') ? _('metered: not speed-tested') : _('no speed test yet');
 			var pct = (sp && maxd > 0) ? (num(sp.down) || 0) / maxd * 100 : 0;
 
-			// Website test: DNS + first-byte per WAN, or why there is none.
 			var wb = webs[w.name], wbNote = null;
 			if (wb && wb.status !== 'ok') {
-				wbNote = (wb.status === 'metered') ? _('metered - websites not tested')
-					: (wb.status === 'busy') ? _('website test skipped - link was busy')
-					: (wb.status === 'nodev') ? _('no device - websites not tested')
+				wbNote = (wb.status === 'metered') ? _('metered: websites not tested')
+					: (wb.status === 'busy') ? _('website test skipped, link was busy')
+					: (wb.status === 'nodev') ? _('no device: websites not tested')
 					: _('last website test failed');
 				wb = null;
 			}
-			if (!wbNote) wbNote = (w.metered === '1') ? _('metered - websites not tested') : _('no website test yet');
+			if (!wbNote) wbNote = (w.metered === '1') ? _('metered: websites not tested') : _('no website test yet');
 			var sc = scores[w.name];
 
 			var rx = num(w.rx_bytes) || 0, tx = num(w.tx_bytes) || 0, live = null, p = prev[w.name];
@@ -173,16 +206,27 @@ return view.extend({
 			if (w.city) where.push(w.city + (w.country ? ', ' + w.country : ''));
 
 			var meta = [
-				E('div', {}, (w.device || '?') + '  ·  ' +
-					(w.gateway ? 'gw ' + w.gateway : _('no gateway')) +
-					(w.link ? '  ·  ' + _('up ') + dur(w.uptime) : '')),
 				E('div', { 'class': 'mk-geo' }, w.pubip
 					? [ E('b', {}, w.pubip), '   ' + where.join('  ·  ') ]
-					: E('span', { 'class': 'mk-dim' }, _('location not looked up yet')))
+					: E('span', { 'class': 'mk-dim' }, _('location not looked up yet'))),
+				E('div', { 'class': 'mk-dim' }, (w.device || '?') + '  ·  ' +
+					(w.gateway ? 'gw ' + w.gateway : _('no gateway')) +
+					(w.link ? '  ·  ' + _('up ') + dur(w.uptime) : ''))
 			];
 			if (g.note) meta.push(E('div', { 'class': 'mk-note' }, g.note));
-			if (speeds[w.name]) meta.push(E('div', { 'class': 'mk-note' },
-				_('Test source: ') + multikmwan.sourceText(speeds[w.name].source)));
+
+			// Websites line: mean first byte, DNS, then each real-content figure.
+			var sites = wb ? [
+				E('span', {}, [ _('Websites '), E('b', {}, fmtMs(wb.ttfb)), ' ms' ]),
+				E('span', {}, [ _('DNS '), E('b', {}, fmtMs(wb.dns)), ' ms' ]) ] : [ E('span', { 'class': 'mk-dim' }, wbNote) ];
+			content.profiles.forEach(function(pf) {
+				var r = content.by[w.name] && content.by[w.name][pf.id];
+				if (!r) return;
+				sites.push(r.status === 'ok'
+					? E('span', { 'title': _('real-content download from ') + (r.host || '') }, [ pf.label + ' ', E('b', {}, fmtSpeed(r.down)), ' Mbps' ])
+					: E('span', { 'class': 'mk-dim' }, pf.label + _(': failed')));
+			});
+			if (wb) sites.push(E('span', { 'class': 'mk-dim' }, ago(wb.epoch, now)));
 
 			return E('div', { 'class': 'mk-card',
 				'style': 'border-left-color:' + (w.color || '#888') }, [
@@ -208,28 +252,19 @@ return view.extend({
 							: '…') ])
 				]),
 				E('div', { 'class': 'mk-speed' }, sp
-					? [ E('span', {}, [ E('b', {}, fmtSpeed(sp.down)), _(' down') ]),
-					    E('span', {}, [ E('b', {}, fmtSpeed(sp.up)), _(' up Mbps') ]),
-					    E('span', { 'class': 'mk-dim' }, _('tested ') + ago(sp.epoch, now)) ]
+					? [ E('span', {}, [ '↓ ', E('b', {}, fmtSpeed(sp.down)), '  ↑ ', E('b', {}, fmtSpeed(sp.up)), ' Mbps' ]),
+					    E('span', { 'class': 'mk-dim' }, ago(sp.epoch, now)) ]
 					: [ E('span', { 'class': 'mk-dim' }, spNote) ]),
 				E('div', { 'class': 'mk-bar' }, [
 					E('span', { 'style': 'width:' + pct.toFixed(0) + '%' })
 				]),
-				E('div', { 'class': 'mk-speed' }, wb
-					? [ E('span', {}, [ _('DNS '), E('b', {}, fmtMs(wb.dns)), ' ms' ]),
-					    E('span', {}, [ _('sites '), E('b', {}, fmtMs(wb.ttfb)), _(' ms to first byte') ]),
-					    E('span', { 'class': 'mk-dim' }, wb.ok + '/' + wb.total + _(' sites, ') + ago(wb.epoch, now)) ]
-					: [ E('span', { 'class': 'mk-dim' }, wbNote) ]),
-				E('div', { 'class': 'mk-foot' },
-					_('priority ') + (w.metric || '?') + '  ·  ' + _('ratio ') + (w.weight || '1') +
-					(w.probe_tx ? '  ·  ' + _('kmwan probes ') + w.probe_rx + '/' + w.probe_tx : '') +
-					(w.health_epoch ? '  ·  ' + _('checked ') + ago(w.health_epoch, now) : ''))
+				E('div', { 'class': 'mk-speed' }, sites),
+				E('div', { 'class': 'mk-foot' }, _('priority ') + (w.metric || '?') + '  ·  ' + _('ratio ') + (w.weight || '1'))
 			]);
 		}));
 		if (!hidden.length) return grid;
 		return E('div', {}, [ grid, E('p', { 'class': 'mk-dim' },
-			_('Disabled in kmwan and not shown: ') + hidden.join(', ') +
-			_('. Enable them on the Settings page to track and test them.')) ]);
+			_('Not shown (disabled in kmwan): ') + hidden.join(', ') + '.') ]);
 	},
 
 	renderRules: function(d) {
@@ -239,7 +274,7 @@ return view.extend({
 
 		if (!clients.length)
 			return E('div', { 'class': 'mk-dim' },
-				_('No client rules configured. Add devices on the Devices page.'));
+				_('No device rules. Add devices on the Devices page.'));
 
 		var prefOff = (d.enabled !== '1');
 		var roleLabel = { fastest: _('Fastest link'), slowest: _('Slowest link'), backup: _('Backup link') };
@@ -271,7 +306,7 @@ return view.extend({
 		var kids = [];
 		if (prefOff)
 			kids.push(E('div', { 'class': 'mk-note' },
-				_('Client preference is OFF — these rules are not applied. Turn it on on the Devices page.')));
+				_('Device preference is off, so these rules are not applied. Turn it on on the Devices page.')));
 		kids.push(E('div', { 'class': 'mk-clients' }, rows));
 		return E('div', {}, kids);
 	},
@@ -326,11 +361,10 @@ return view.extend({
 			preserveAspectRatio: 'xMidYMid meet' }, kids);
 	},
 
-	// Download + upload charts of the last few speed runs, side by side.
+	// Download + upload charts of the last few speed runs; the attributed log
+	// (profile, actual hosts, per-direction status) sits collapsed beneath.
 	renderGraph: function(d) {
 		var runs = (d.speedhist || []);
-		// Rows for links disabled in kmwan (recorded before scheduled tests
-		// learned to skip them) are noise here; the History page keeps them.
 		var off = {};
 		(d.wans || []).forEach(function(w) { if (w.disabled === '1') off[w.name] = true; });
 		d.testhistory = (d.testhistory || []).filter(function(t) { return !off[t.wan]; });
@@ -339,13 +373,14 @@ return view.extend({
 				test.source = (d.testhistory || []).filter(function(t) { return t.wan === test.name && t.epoch === test.epoch; }).pop();
 			});
 		});
+		var log = E('details', { 'class': 'mk-more' }, [
+			E('summary', {}, _('Speed test log')),
+			E('p', { 'class': 'mk-dim' }, _('Transfers made by MultiKmwan against the listed service or host, not official provider scores. Daily averages can mix sources.')),
+			multikmwan.testTable(d.testhistory, 10) ]);
 		if (!runs.length)
-			return E('div', {}, [ E('p', { 'class': 'mk-dim' },
-				_('No successful speed tests recorded yet.')),
-				multikmwan.testTable(d.testhistory, 10) ]);
+			return E('div', {}, [ E('p', { 'class': 'mk-dim' }, _('No successful speed tests yet.')), log ]);
 		var now = num(d.now) || Math.floor(Date.now() / 1000);
 		var palette = ['#2a6fb5', '#1f8b4c', '#d9a400', '#b3312c', '#7a4fb5', '#0f8b8b'];
-		// Colours come from the backend (stable per WAN across every page).
 		var color = {};
 		(d.wans || []).forEach(function(w) { if (w.color) color[w.name] = w.color; });
 		var wans = [], seen = {};
@@ -371,17 +406,15 @@ return view.extend({
 					this._barChart(runs, 'up', _('Mbps'), color, wans, now) ])
 			]),
 			legend,
-			E('p', { 'class': 'mk-dim' }, _('Transfer tests use the listed cloud service or custom host; these are not official provider speed scores. Daily averages can include different sources.')),
-			multikmwan.testTable(d.testhistory, 10)
+			log
 		]);
 	},
 
-	// Per-site results as a grid: one row per site, one column per WAN.
+	// Raw per-site grid: one row per site, one column per link. Collapsed
+	// under the ranking; the summary lines above it carry the message.
 	renderSites: function(d) {
 		var rows = d.websites || [];
-		if (!rows.length)
-			return E('p', { 'class': 'mk-dim' },
-				_('No website test yet. Use "Test websites", or wait for the next auto-rank.'));
+		if (!rows.length) return E('p', { 'class': 'mk-dim' }, _('No website test yet.'));
 		var wans = [], seen = {}, hosts = [], hseen = {}, cell = {};
 		(d.wans || []).forEach(function(w) { if (w.disabled === '1') seen[w.name] = true; });
 		(d.wans || []).forEach(function(w) { if (!seen[w.name]) { seen[w.name] = true; wans.push(w.name); } });
@@ -392,49 +425,162 @@ return view.extend({
 		});
 		var head = E('tr', {}, [ E('th', {}, _('Site')) ].concat(wans.map(function(n) { return E('th', {}, n); })));
 		var body = hosts.map(function(h) {
-			return E('tr', {}, [ E('td', {}, h) ].concat(wans.map(function(n) {
+			var best = null;
+			wans.forEach(function(n) {
+				var r = cell[n + '|' + h], v = r && r.status === 'ok' ? num(r.ttfb) : null;
+				if (v !== null && (best === null || v < best)) best = v;
+			});
+			return E('tr', {}, [ E('td', { 'title': h }, siteName(h)) ].concat(wans.map(function(n) {
 				var r = cell[n + '|' + h];
 				if (!r) return E('td', { 'class': 'mk-dim' }, '-');
 				if (r.status !== 'ok') return E('td', { 'class': 'mk-note' }, _('failed') + ' (' + r.status + ')');
-				return E('td', {}, _('DNS ') + fmtMs(r.dns) + '  ·  ' + _('first byte ') + fmtMs(r.ttfb) +
-					'  ·  ' + _('page ') + fmtMs(r.load) + ' ms');
+				var lead = best !== null && num(r.ttfb) === best && wans.length > 1;
+				return E('td', { 'class': lead ? 'mk-lead' : '' }, _('DNS ') + fmtMs(r.dns) + '  ·  ' + _('first byte ') + fmtMs(r.ttfb) +
+					'  ·  ' + _('page ') + fmtMs(r.load) + ' ms' + (lead ? ' ✓' : ''));
 			})));
 		});
 		return E('div', {}, [
 			E('div', { 'style': 'overflow-x:auto' }, E('table', { 'class': 'table mk-sites' }, [
 				E('thead', {}, head), E('tbody', {}, body) ])),
-			E('p', { 'class': 'mk-dim' }, _('Each cell is one DNS-over-HTTPS lookup and one page fetch made ' +
-				'from the router over that WAN. DNS is the resolver round trip; first byte is connect, TLS ' +
-				'and the server\'s response; page is the full HTML download. A redirect counts as a response. ' +
-				'Only sites that every link loaded are compared for the score.'))
+			E('p', { 'class': 'mk-dim' }, _('Per site and link, from the router: DNS is the resolver round trip, ' +
+				'first byte is connect, TLS and the server\'s answer, page is the full HTML. A redirect counts. ' +
+				'Only sites every link loaded count towards the score.'))
 		]);
 	},
 
-	// One line explaining what "fastest" means right now.
-	rankText: function(d) {
-		var r = d.rank || {};
-		if (!compositeOn(d)) {
-			var by = { down: _('download'), up: _('upload') }[r.by] || _('download + upload');
-			return _('Fastest = throughput only (') + by + ')';
+	// "Which line loads the internet faster?" A verdict in words, one table
+	// (the leader shows its figure, the others how far behind they are), and
+	// one line per site. Raw numbers sit in tooltips and the collapsed grid.
+	renderRanking: function(d) {
+		var scores = (d.scores || []).slice().sort(function(a, b) { return (num(b.score) || 0) - (num(a.score) || 0); });
+		var composite = compositeOn(d), content = contentIndex(d);
+		if (!scores.length)
+			return E('p', { 'class': 'mk-dim' }, _('No ranking yet. Run a speed test, then a website test.'));
+		var speeds = {}, color = {};
+		(d.speed || []).forEach(function(s) { speeds[s.name] = s; });
+		(d.wans || []).forEach(function(w) { color[w.name] = w.color; });
+		// Columns: get() -> number or null; fmt() -> the leader's cell text.
+		var cols = [
+			{ key: 'down', label: _('Download'), noun: _('downloads'), lower: false,
+			  get: function(s) { var sp = speeds[s.name]; return sp && sp.status === 'ok' ? num(sp.down) : null; },
+			  fmt: function(v) { return fmtSpeed(v) + ' Mbps'; } },
+			{ key: 'up', label: _('Upload'), noun: _('uploads'), lower: false,
+			  get: function(s) { var sp = speeds[s.name]; return sp && sp.status === 'ok' ? num(sp.up) : null; },
+			  fmt: function(v) { return fmtSpeed(v) + ' Mbps'; } },
+			{ key: 'web', label: _('Websites'), noun: _('website response'), lower: true,
+			  get: function(s) { return num(s.web); }, fmt: function(v) { return fmtMs(v) + ' ms'; } },
+			{ key: 'latency', label: _('Latency'), noun: _('latency'), lower: true,
+			  get: function(s) { return num(s.latency); }, fmt: function(v) { return fmtMs(v) + ' ms'; } },
+			{ key: 'dns', label: _('DNS'), noun: _('DNS'), lower: true,
+			  get: function(s) { return num(s.dns); }, fmt: function(v) { return fmtMs(v) + ' ms'; } }
+		];
+		content.profiles.forEach(function(pf) {
+			cols.push({ key: 'content:' + pf.id, label: pf.label, noun: pf.label + _(' downloads'), lower: false,
+				get: function(s) { var r = content.by[s.name] && content.by[s.name][pf.id]; return r && r.status === 'ok' ? num(r.down) : null; },
+				fmt: function(v) { return fmtSpeed(v) + ' Mbps'; } });
+		});
+		// A column leads only where at least two links were measured.
+		var bests = {}, counts = {};
+		cols.forEach(function(c) {
+			var b = null, n = 0;
+			scores.forEach(function(s) { var v = c.get(s); if (v === null) return; n++; if (b === null || (c.lower ? v < b : v > b)) b = v; });
+			bests[c.key] = n > 1 ? b : null; counts[c.key] = n;
+		});
+		function leads(s, c) { var v = c.get(s); return v !== null && bests[c.key] !== null && v === bests[c.key]; }
+		var many = scores.length > 1;
+		var head = E('tr', {}, [ E('th', {}, _('Link')), E('th', {}, _('Score')) ].concat(cols.map(function(c) { return E('th', {}, c.label); })));
+		var body = scores.map(function(s, i) {
+			return E('tr', {}, [
+				E('td', {}, [ E('span', { 'class': 'mk-dot', 'style': 'background:' + (color[s.name] || '#888') }),
+					E('b', {}, s.name), i === 0 && many ? E('span', { 'class': 'mk-tag' }, _('fastest')) : '' ]),
+				E('td', { 'title': composite ? scoreTitle(s, d.rank) : '' },
+					composite && num(s.score) !== null ? E('b', {}, String(Math.round(num(s.score)))) : '-')
+			].concat(cols.map(function(c) {
+				var v = c.get(s);
+				if (v === null) return E('td', { 'class': 'mk-dim' }, '-');
+				if (bests[c.key] === null) return E('td', {}, c.fmt(v));
+				if (leads(s, c)) return E('td', { 'class': 'mk-lead' }, c.fmt(v) + ' ✓');
+				return E('td', { 'title': c.fmt(v) }, slower(v, bests[c.key], c.lower));
+			})));
+		});
+
+		// Verdict: who wins overall, what it wins on, where a rival is ahead.
+		var top = scores[0], wins = [], behind = [], verdict;
+		cols.forEach(function(c) {
+			if (bests[c.key] === null || c.get(top) === null || !many) return;
+			if (leads(top, c)) wins.push(c.noun);
+			else {
+				var who = scores.filter(function(s) { return leads(s, c); }).map(function(s) { return s.name; }).join(', ');
+				if (slower(c.get(top), bests[c.key], c.lower) !== _('about the same')) behind.push(who + _(' is ahead on ') + c.noun);
+			}
+		});
+		function list(a) { return a.length < 2 ? a.join('') : a.slice(0, -1).join(', ') + _(' and ') + a[a.length - 1]; }
+		if (!many) {
+			verdict = top.name + _(' is the only line with a measurement, so there is nothing to compare yet.');
+		} else {
+			verdict = E('span', {}, [ E('b', {}, top.name), _(' is the faster line right now') +
+				(composite ? ' (' + _('score ') + Math.round(num(top.score)) + _(' vs ') +
+					scores.slice(1).map(function(s) { return s.name + ' ' + Math.round(num(s.score)); }).join(', ') + ')' : '') + '. ' +
+				(wins.length ? _('It wins on ') + list(wins) + '. ' : '') +
+				(behind.length ? behind.join('; ') + '.' : '') ]);
 		}
-		return _('Fastest = throughput ') + (r.w_speed || 40) + '%  ·  ' + _('website response ') +
-			(r.w_web || 25) + '%  ·  ' + _('latency ') + (r.w_latency || 20) + '%  ·  ' +
-			_('DNS ') + (r.w_dns || 15) + '%';
+
+		// One line per site: who answered it soonest, and how the others compare.
+		var siteLines = [], hosts = [], cell = {}, hseen = {};
+		(d.websites || []).forEach(function(r) {
+			if (!hseen[r.host]) { hseen[r.host] = true; hosts.push(r.host); }
+			cell[r.name + '|' + r.host] = r;
+		});
+		var names = scores.map(function(s) { return s.name; });
+		hosts.forEach(function(h) {
+			var best = null, bestName = null;
+			names.forEach(function(n) {
+				var r = cell[n + '|' + h], v = r && r.status === 'ok' ? num(r.ttfb) : null;
+				if (v !== null && (best === null || v < best)) { best = v; bestName = n; }
+			});
+			if (best === null) return;
+			var rest = names.filter(function(n) { return n !== bestName; }).map(function(n) {
+				var r = cell[n + '|' + h];
+				return n + ' ' + (r && r.status === 'ok' ? slower(num(r.ttfb), best, true) : _('failed'));
+			});
+			siteLines.push(E('li', { 'title': _('first byte ') + fmtMs(best) + ' ms' }, [
+				E('b', {}, siteName(h)), '  ·  ', E('span', { 'class': 'mk-lead' }, bestName + ' ✓'),
+				rest.length ? '  ·  ' + rest.join('  ·  ') : '' ]));
+		});
+
+		var r = d.rank || {}, ar = num(d.autorank && d.autorank.interval) || 0, margin = num(d.autorank && d.autorank.margin);
+		var foot = composite
+			? _('Score: throughput ') + (r.w_speed || 40) + '%, ' + _('websites ') + (r.w_web || 25) + '%, ' +
+			  _('latency ') + (r.w_latency || 20) + '%, ' + _('DNS ') + (r.w_dns || 15) + _('%, each against the best line.')
+			: _('Ranking by throughput only.');
+		if (ar > 0 && margin !== null) foot += _(' Auto-rank switches only when a rival beats the leader by ') + margin + '%.';
+
+		return E('div', {}, [
+			E('p', { 'class': 'mk-verdict' }, verdict),
+			E('div', { 'style': 'overflow-x:auto' }, E('table', { 'class': 'table mk-rank' }, [ E('thead', {}, head), E('tbody', {}, body) ])),
+			siteLines.length ? E('ul', { 'class': 'mk-list' }, siteLines) : '',
+			E('details', { 'class': 'mk-more' }, [ E('summary', {}, _('Measurements')),
+				E('p', { 'class': 'mk-dim' }, foot), this.renderSites(d) ])
+		]);
 	},
 
 	modeText: function(d) {
 		var now = num(d.now) || Math.floor(Date.now() / 1000);
 		var a = d.autorank || {}, ar = num(a.interval) || 0, t;
-		// The user-facing mode: Fastest = failover + auto-rank on.
-		var mode = (d.mode !== 'failover') ? _('Load balance')
-			: (ar > 0 ? _('Fastest (auto)') : _('Failover'));
-		t = _('Mode: ') + mode;
-		if (ar > 0)
-			t += '   ·   ' + _('auto-rank every ') + ar + _(' min')
-				+ (a.epoch ? ' (' + _('last: ') + (a.decision || '?') + ', ' + ago(a.epoch, now) + ')' : '');
-		if (d.enabled !== '1') t += '   ·   ' + _('client preference off');
-		t += '   ·   ' + this.rankText(d);
+		var mode = (d.mode !== 'failover') ? _('Load balance') : (ar > 0 ? _('Fastest') : _('Failover'));
+		var decision = { unchanged: _('no change'), 'same-leader': _('no change'), 'within-margin': _('within margin, no change'),
+			applied: _('leader changed'), 'no-results': _('no result') }[a.decision] || a.decision;
+		t = mode + _(' mode');
+		if (ar > 0) t += '  ·  ' + _('re-checked every ') + ar + _(' min') + (a.epoch ? '  ·  ' + _('last check ') + ago(a.epoch, now) + ': ' + decision : '');
+		if (d.enabled !== '1') t += '  ·  ' + _('device preference off');
 		return t;
+	},
+
+	// What the tests run against, in one dim line.
+	sourceText: function(d) {
+		var ts = d.test_source || {}, sites = [], seen = {};
+		(d.websites || []).forEach(function(r) { if (!seen[r.host]) { seen[r.host] = true; sites.push(siteName(r.host)); } });
+		return _('Speed tests: ') + (ts.label || _('not set')) + (sites.length ? '  ·  ' + _('Websites: ') + sites.join(', ') : '');
 	},
 
 	render: function(d) {
@@ -444,22 +590,22 @@ return view.extend({
 			E('style', {}, CSS),
 			E('h2', {}, _('MultiKmwan')),
 			E('div', { 'class': 'mk-mode', 'id': 'mk-mode' }, this.modeText(d)),
+			E('h3', {}, _('Which line loads the internet faster?')),
+			E('div', { 'id': 'mk-ranking' }, this.renderRanking(d)),
 			E('div', { 'id': 'mk-cards' }, this.renderWans(d)),
 
 			E('div', { 'class': 'mk-actions' }, [
 				E('button', {
 					'class': 'cbi-button cbi-button-action',
 					'click': ui.createHandlerFn(this, function() {
-						ui.addNotification(null, E('p', _('Speed test running - up to a minute ' +
-							'per WAN. Results appear on the cards as they finish.')), 'info');
+						ui.addNotification(null, E('p', _('Speed test running, up to a minute per link.')), 'info');
 						return callSpeed();
 					})
 				}, _('Run speed test')),
 				E('button', {
 					'class': 'cbi-button cbi-button-action',
 					'click': ui.createHandlerFn(this, function() {
-						ui.addNotification(null, E('p', _('Website test running - a DNS lookup and ' +
-							'a page fetch per site, per WAN. Results appear on the cards as they finish.')), 'info');
+						ui.addNotification(null, E('p', _('Website test running.')), 'info');
 						return callWeb();
 					})
 				}, _('Test websites')),
@@ -471,7 +617,7 @@ return view.extend({
 							ui.addNotification(null, E('pre', (r && r.result) || _('ranked')), 'info');
 						});
 					})
-				}, _('Rank WANs now')),
+				}, _('Rank now')),
 				E('button', {
 					'class': 'cbi-button cbi-button-neutral',
 					'click': ui.createHandlerFn(this, function() {
@@ -479,13 +625,12 @@ return view.extend({
 							ui.addNotification(null, E('p', _('Health probe started.')), 'info');
 						});
 					})
-				}, _('Check health now')),
+				}, _('Check health')),
 				E('button', {
 					'class': 'cbi-button cbi-button-neutral',
 					'click': ui.createHandlerFn(this, function() {
 						return callGeo().then(function() {
-							ui.addNotification(null, E('p', _('Looking up public IP / ISP / ' +
-								'location for each WAN...')), 'info');
+							ui.addNotification(null, E('p', _('Looking up each link\'s public address and location.')), 'info');
 						});
 					})
 				}, _('Refresh location')),
@@ -493,20 +638,17 @@ return view.extend({
 					'class': 'cbi-button cbi-button-neutral',
 					'click': ui.createHandlerFn(this, function() {
 						return callSync().then(function() {
-							ui.addNotification(null, E('p', _('Client rules re-applied.')), 'info');
+							ui.addNotification(null, E('p', _('Device rules re-applied.')), 'info');
 						});
 					})
-				}, _('Sync client rules'))
+				}, _('Sync device rules'))
 			]),
+			E('p', { 'id': 'mk-test-source', 'class': 'mk-dim' }, this.sourceText(d)),
 
-			E('p', { 'id': 'mk-test-source', 'class': 'mk-note' }, _('Next test source: ') + multikmwan.sourceText(d.test_source)),
 			E('h3', {}, _('Recent speed tests')),
 			E('div', { 'id': 'mk-graph' }, this.renderGraph(d)),
 
-			E('h3', {}, _('Website response')),
-			E('div', { 'id': 'mk-sites' }, this.renderSites(d)),
-
-			E('h3', {}, _('Active client rules')),
+			E('h3', {}, _('Device rules')),
 			E('div', { 'id': 'mk-rules' }, this.renderRules(d))
 		]);
 
@@ -516,14 +658,18 @@ return view.extend({
 				var r = document.getElementById('mk-rules');
 				var m = document.getElementById('mk-mode');
 				var g = document.getElementById('mk-graph');
-				var s = document.getElementById('mk-sites');
+				var k = document.getElementById('mk-ranking');
 				var source = document.getElementById('mk-test-source');
-				if (source) source.textContent = _('Next test source: ') + multikmwan.sourceText(nd.test_source);
+				// Keep an opened "Measurements" / "Speed test log" open across refreshes.
+				var open = {};
+				document.querySelectorAll('details.mk-more').forEach(function(el) { open[el.querySelector('summary').textContent] = el.open; });
+				if (source) source.textContent = self.sourceText(nd);
+				if (k) { k.innerHTML = ''; k.appendChild(self.renderRanking(nd)); }
 				if (c) { c.innerHTML = ''; c.appendChild(self.renderWans(nd)); }
 				if (r) { r.innerHTML = ''; r.appendChild(self.renderRules(nd)); }
 				if (m) m.textContent = self.modeText(nd);
 				if (g) { g.innerHTML = ''; g.appendChild(self.renderGraph(nd)); }
-				if (s) { s.innerHTML = ''; s.appendChild(self.renderSites(nd)); }
+				document.querySelectorAll('details.mk-more').forEach(function(el) { if (open[el.querySelector('summary').textContent]) el.open = true; });
 			});
 		}, 5);
 

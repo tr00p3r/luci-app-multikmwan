@@ -7,6 +7,7 @@ GEO_FILE=/tmp/multikmwan.geo
 SPEEDHIST_FILE=/tmp/multikmwan.speedhist
 WEB_FILE=/tmp/multikmwan.web
 WEBSITES_FILE=/tmp/multikmwan.websites
+CONTENT_FILE=/tmp/multikmwan.content
 HIST_FILE=/etc/multikmwan/history.csv
 AUTO_FILE=/tmp/multikmwan.autorank
 
@@ -212,6 +213,25 @@ EOF
 			json_add_string epoch "$e"
 			json_close_object
 		done < "$WEBSITES_FILE"
+	fi
+	json_close_array
+
+	# Real-content throughput per WAN for each "page" profile (Facebook...).
+	json_add_array content
+	if [ -f "$CONTENT_FILE" ]; then
+		while read -r w p dl st h e; do
+			[ -n "$w" ] || continue
+			[ "${w#\#}" = "$w" ] || continue
+			json_add_object ""
+			json_add_string name "$w"
+			json_add_string profile "$p"
+			json_add_string label "$(uci -q get multikmwan."$p".label)"
+			json_add_string down "$dl"
+			json_add_string status "$st"
+			json_add_string host "$h"
+			json_add_string epoch "$e"
+			json_close_object
+		done < "$CONTENT_FILE"
 	fi
 	json_close_array
 

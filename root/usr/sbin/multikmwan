@@ -8,6 +8,8 @@ HEALTH_FILE=/tmp/multikmwan.health
 GEO_FILE=/tmp/multikmwan.geo
 AUTO_FILE=/tmp/multikmwan.autorank
 SPEEDHIST_FILE=/tmp/multikmwan.speedhist
+WEB_FILE=/tmp/multikmwan.web
+WEBSITES_FILE=/tmp/multikmwan.websites
 # Persistent 90-day history lives on flash. Kept tiny: one rolled-up row per
 # WAN per day, flushed at most hourly, pruned to HIST_DAYS. An in-RAM
 # accumulator absorbs the frequent samples so flash is barely touched.
@@ -17,9 +19,23 @@ ACC_FILE=/tmp/multikmwan.acc
 STATE_FILE=/tmp/multikmwan.wanstate
 HIST_DAYS=90
 LOCK=/var/lock/multikmwan.lock
+QUALITY_DIR=/tmp/multikmwan-quality
+QUALITY_LIB=/usr/share/multikmwan
 WANS=""
 
 log() { logger -t multikmwan "$*"; [ -t 1 ] && echo "$*"; }
+
+# Lock an already-open descriptor, giving up after N seconds. BusyBox flock
+# (the one on GL.iNet firmware) has no -w, so the wait is a poll with -n.
+#   flock_wait <fd> <seconds> [-s]
+flock_wait() {
+	local fd="$1" secs="$2" mode="$3" i=0
+	while ! flock -n $mode "$fd" 2>/dev/null; do
+		i=$((i + 1))
+		[ "$i" -lt "$secs" ] || return 1
+		sleep 1
+	done
+}
 
 g() {
 	local _v
@@ -39,8 +55,8 @@ _wan_cb() {
 	[ "$addr_type" = "4" ] || return 0
 	config_get iface "$s" interface
 	[ -n "$iface" ] || return 0
-	network_get_device dev "$iface" 2>/dev/null
-	[ -n "$dev" ] || return 0
+	# Keep configured identities even while their devices disappear.
+	case " $WANS " in *" $iface "*) return 0 ;; esac
 	WANS="$WANS $iface"
 }
 
@@ -73,6 +89,10 @@ wan_table() {
 
 # Backup-only / metered link: never speed-tested, ranked last with ratio 0.
 wan_metered() { [ "$(uci -q get multikmwan."$1".metered)" = "1" ]; }
+
+# Disabled in kmwan: not tracked and never routed to. Scheduled tests skip
+# such a link silently instead of logging a failed "nodev" result every run.
+wan_disabled() { [ "$(uci -q get kmwan."$1".disabled)" = "1" ]; }
 
 wan_up() {
 	local dev
@@ -113,15 +133,15 @@ flush_rules() {
 	done
 }
 
-# Non-metered WANs ordered by last measured download. dir=desc → fastest first,
-# asc → slowest first. Falls back to config order when there's no speed data.
+# Non-metered WANs, best first (desc) or worst first (asc), by the same
+# ranking "Fastest" mode uses (composite score, or throughput when the
+# composite is off). Config order when there is no speed data yet.
 _wans_by_speed() {
-	local dir="$1" flag="-rn" w dl
-	[ "$dir" = "asc" ] && flag="-n"
+	local dir="$1" score w
 	if [ ! -f "$SPEED_FILE" ]; then collect_wans; echo "$WANS"; return; fi
-	{ awk '$1 !~ /^#/ && $4=="ok" {print $2" "$1}' "$SPEED_FILE" | \
-		while read -r dl w; do wan_metered "$w" || echo "$dl $w"; done | \
-		sort $flag | awk '{printf "%s ", $2}'; }
+	rank_sorted "$(g rank_by sum)" | awk '{print $1, $2}' |
+		{ if [ "$dir" = "asc" ]; then sort -n; else cat; fi; } |
+		while read -r score w; do wan_metered "$w" || printf '%s ' "$w"; done
 }
 
 # Metered/backup links first, then everything else as fallback.
@@ -220,28 +240,128 @@ cmd_mode() {
 }
 
 # ------------------------------------------------------------- speed test
+# Only hostnames are kept: signed URL queries, paths and credentials never
+# enter the source history. Labels are snapshots, not lookups of today's UCI.
+st_host() {
+	local host="${1#*://}"
+	host="${host%%/*}"; host="${host%%\?*}"; host="${host%%\#*}"; host="${host##*@}"
+	printf '%s' "$host" | tr -cd 'A-Za-z0-9.:[\]-' | cut -c1-253
+}
+
+st_config() {
+	# MK_SERVER=<profile> in the environment overrides the configured server,
+	# for one-off runs from the shell: MK_SERVER=facebook multikmwan speedtest
+	ST_PROFILE=${MK_SERVER:-$(g active_server '')}
+	ST_LABEL='Custom URLs'
+	ST_URL_DOWN=''; ST_URL_UP=''
+	# A profile's kind is "file" (fixed file or sized endpoint, the default)
+	# or "page": the download URL is a web page whose own assets are pulled
+	# from its CDN, so the figure is real-content throughput for that site.
+	ST_DOWN_KIND=file
+	if [ -n "$ST_PROFILE" ] && [ -n "$(uci -q get multikmwan.$ST_PROFILE)" ]; then
+		ST_URL_DOWN=$(uci -q get multikmwan.$ST_PROFILE.down_url)
+		ST_URL_UP=$(uci -q get multikmwan.$ST_PROFILE.up_url)
+		ST_LABEL=$(uci -q get multikmwan.$ST_PROFILE.label)
+		[ "$(uci -q get multikmwan.$ST_PROFILE.kind)" = page ] && ST_DOWN_KIND=page
+	fi
+	[ -n "$ST_URL_DOWN" ] || ST_URL_DOWN=$(g st_down_url 'https://speed.cloudflare.com/__down?bytes={bytes}')
+	[ -n "$ST_URL_UP" ] || ST_URL_UP=$(g st_up_url 'https://speed.cloudflare.com/__up')
+	ST_HOST_DOWN=$(st_host "$ST_URL_DOWN"); ST_HOST_UP=$(st_host "$ST_URL_UP")
+	if [ -z "$ST_PROFILE" ] && [ "$ST_HOST_DOWN" = speed.cloudflare.com ] && [ "$ST_HOST_UP" = speed.cloudflare.com ]; then
+		ST_LABEL=Cloudflare
+	fi
+	ST_LABEL=$(printf '%s' "${ST_LABEL:-$ST_PROFILE}" | tr ',|\r\n' '    ' | cut -c1-100)
+	ST_PROFILE=$(printf '%s' "${ST_PROFILE:-inline}" | tr -cd 'A-Za-z0-9_.-' | cut -c1-64)
+}
+
+st_report() {
+	printf '%s %s %s %s\n' "$1" "$2" "$3" "$4"
+	[ -n "$ST_META_FILE" ] || return 0
+	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+		"$ST_TEST_EPOCH" "$1" "$2" "$3" "$4" "${ST_KIND:-manual}" \
+		"$ST_LABEL" "$ST_PROFILE" "$ST_HOST_DOWN" "$ST_HOST_UP" \
+		"${ST_DOWN_STATUS:-not_run}" "${ST_UP_STATUS:-not_run}" >> "$ST_META_FILE"
+}
+
+# Asset URLs a page references (scripts, styles, images, fonts, media), one
+# per line, first seen first, at most $2. Pages embed many of them JSON-
+# escaped ("https:\/\/cdn\/x.js", Facebook even "https:\\\/\\\/") or with
+# &amp;, so those forms are normalised before matching.
+st_page_assets() {
+	sed 's|\\*/|/|g; s|&amp;|\&|g' "$1" |
+		grep -oE 'https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+\.(js|css|png|jpg|jpeg|gif|webp|svg|woff2?|mp4|webm)(\?[A-Za-z0-9._~:/?#@!$&()*+,;=%-]*)?' |
+		awk '!seen[$0]++' | head -n "$2"
+}
+
+# Real-content download for a "page" profile: how fast this WAN pulls from
+# the site's own CDN, which an ISP-hosted speedtest server cannot show.
+# Phase 1 fetches the page and each discovered asset once, in parallel, as a
+# browser does on page load. Phase 2 has every stream pull the largest asset
+# back to back inside one curl (connection reuse, like a browser) until the
+# byte budget is met. Writes d$i/de$i per stream in the fixed-file format so
+# st_validate treats both kinds alike; a stream's rate is its bytes over the
+# sum of its transfer times.
+st_page_download() {
+	local dev="$1" page="$2" bytes="$3" streams="$4" to="$5" tmpd="$6"
+	local html="$tmpd/page.html" i=0 url best size per reps args j
+	curl -sL -4 --max-redirs 5 --proto '=http,https' --proto-redir '=http,https' \
+		--interface "$dev" --max-time "$to" -o "$html" "$page" 2>/dev/null
+	[ -f "$html" ] && st_page_assets "$html" 12 > "$tmpd/assets" || : > "$tmpd/assets"
+	while read -r url; do
+		i=$((i + 1))
+		(curl -s -4 --proto '=https' --interface "$dev" --max-time "$to" -o /dev/null \
+			-w '%{size_download} %{http_code} %{time_total} %{url_effective}\n' \
+			"$url" > "$tmpd/a$i" 2>/dev/null) &
+	done < "$tmpd/assets"
+	wait
+	best=$(cat "$tmpd"/a* 2>/dev/null | awk '$2==200 && $1>0 {print $1, $4}' | sort -rn | head -1)
+	size=${best%% *}; url=${best#* }
+	i=1
+	if [ -z "$best" ]; then
+		# Nothing usable: report every stream as failed with a telling status.
+		while [ "$i" -le "$streams" ]; do
+			echo "0 000 0 0 $page" > "$tmpd/d$i"; echo noassets > "$tmpd/de$i"
+			i=$((i + 1))
+		done
+		return 0
+	fi
+	per=$((bytes / streams))
+	reps=$(( (per + size - 1) / size ))
+	[ "$reps" -ge 1 ] || reps=1
+	[ "$reps" -le 200 ] || reps=200
+	args=''; j=0
+	while [ "$j" -lt "$reps" ]; do args="$args $url"; j=$((j + 1)); done
+	while [ "$i" -le "$streams" ]; do
+		(curl -s -4 --proto '=https' --interface "$dev" --max-time "$to" \
+			-w '%{stderr}%{size_download} %{http_code} %{time_total} %{url_effective}\n' \
+			$args >/dev/null 2>"$tmpd/p$i"; echo "$?" > "$tmpd/de$i"
+		 awk '{ b+=$1; t+=$3; if ($2<200 || $2>=300) bad=$2; u=$4 }
+			END { if (t<=0) t=1e-9; printf "%.0f %s %d %.3f %s\n", b/t, (bad=="" ? 200 : bad), b, t, u }' \
+			"$tmpd/p$i" > "$tmpd/d$i") &
+		i=$((i + 1))
+	done
+	wait
+}
+
 # Measures each WAN by binding curl to that WAN's device, so the result is
 # that link's throughput regardless of which one the routing table prefers.
 st_one() {
 	local w="$1" dev bytes to url_d url_u bd bu dl ul srv
+	st_config
+	ST_DOWN_STATUS=not_run; ST_UP_STATUS=not_run
 	dev=$(wan_dev "$w")
-	[ -n "$dev" ] || { echo "$w 0 0 nodev"; return 0; }
+	[ -n "$dev" ] || { st_report "$w" 0 0 nodev; return 0; }
 	bytes=${ST_BYTES:-$(g st_bytes 25000000)}
 	to=$(g st_timeout 25)
 	local streams dbytes
 	streams=$(g st_streams 4)
 	[ "$streams" -ge 1 ] 2>/dev/null || streams=4
+	[ "$streams" -le 8 ] 2>/dev/null || streams=8
+	[ "$to" -ge 1 ] 2>/dev/null && [ "$to" -le 120 ] 2>/dev/null || to=25
 	# Active server profile (config server '<id>') wins; otherwise the inline
 	# custom URLs. Either way a profile's blank field falls back to the inline
 	# one, so you can define a download-only server.
-	srv=$(g active_server "")
-	url_d=""; url_u=""
-	if [ -n "$srv" ] && [ -n "$(uci -q get multikmwan.$srv)" ]; then
-		url_d=$(uci -q get multikmwan.$srv.down_url)
-		url_u=$(uci -q get multikmwan.$srv.up_url)
-	fi
-	[ -n "$url_d" ] || url_d=$(g st_down_url 'https://speed.cloudflare.com/__down?bytes={bytes}')
-	[ -n "$url_u" ] || url_u=$(g st_up_url 'https://speed.cloudflare.com/__up')
+	url_d="$ST_URL_DOWN"; url_u="$ST_URL_UP"
 	# "{bytes}" is substituted; a URL ending in "=" gets the size appended
 	# (old config format); anything else is fetched as-is (fixed-size file).
 	# Divide the size across streams so total download ~= the configured size
@@ -262,14 +382,23 @@ st_one() {
 	rm -rf "$tmpd"; mkdir -p "$tmpd"
 
 	# --- parallel download: each stream reports its own speed, we sum them ---
-	i=1
-	while [ "$i" -le "$streams" ]; do
-		curl -sL -o /dev/null --interface "$dev" --max-time "$to" \
-			-w '%{speed_download}\n' "$url_d" > "$tmpd/d$i" 2>/dev/null &
-		i=$((i + 1))
-	done
-	wait
-	bd=$(cat "$tmpd"/d* 2>/dev/null | awk '{s += $1} END { printf "%.0f", s }')
+	if [ "$ST_DOWN_KIND" = page ]; then
+		st_page_download "$dev" "$ST_URL_DOWN" "$bytes" "$streams" "$to" "$tmpd"
+	else
+		i=1
+		while [ "$i" -le "$streams" ]; do
+			(curl -sL --max-redirs 5 --proto '=http,https' --proto-redir '=http,https' \
+				-o /dev/null --interface "$dev" --max-time "$to" \
+				-w '%{speed_download} %{http_code} %{size_download} %{time_total} %{url_effective}\n' \
+				"$url_d" > "$tmpd/d$i" 2>/dev/null; echo "$?" > "$tmpd/de$i") &
+			i=$((i + 1))
+		done
+		wait
+	fi
+	bd=$(st_validate "$tmpd" d "$streams")
+	# st_validate runs in a subshell: read its explicit status output.
+	ST_DOWN_STATUS=$(cat "$tmpd/dstatus")
+	ST_HOST_DOWN=$(cat "$tmpd/dhosts")
 	[ -n "$bd" ] || bd=0
 
 	# --- parallel upload of generated data (/dev/zero). Total buffered across
@@ -281,14 +410,18 @@ st_one() {
 	[ "$per" -ge 65536 ] || per=65536
 	i=1
 	while [ "$i" -le "$streams" ]; do
-		dd if=/dev/zero bs=65536 count=$((per / 65536)) 2>/dev/null | \
-			curl -sL -o /dev/null --interface "$dev" --max-time "$to" \
+		(dd if=/dev/zero bs=65536 count=$((per / 65536)) 2>/dev/null | \
+			curl -sL --max-redirs 5 --proto '=http,https' --proto-redir '=http,https' \
+			-o /dev/null --interface "$dev" --max-time "$to" \
 			-H 'Content-Type: application/octet-stream' \
-			-w '%{speed_upload}\n' --data-binary @- "$url_u" > "$tmpd/u$i" 2>/dev/null &
+			-w '%{speed_upload} %{http_code} %{size_upload} %{time_total} %{url_effective}\n' \
+			--data-binary @- "$url_u" > "$tmpd/u$i" 2>/dev/null; echo "$?" > "$tmpd/ue$i") &
 		i=$((i + 1))
 	done
 	wait
-	bu=$(cat "$tmpd"/u* 2>/dev/null | awk '{s += $1} END { printf "%.0f", s }')
+	bu=$(st_validate "$tmpd" u "$streams")
+	ST_UP_STATUS=$(cat "$tmpd/ustatus")
+	ST_HOST_UP=$(cat "$tmpd/uhosts")
 	[ -n "$bu" ] || bu=0
 	rm -rf "$tmpd"
 
@@ -297,8 +430,31 @@ st_one() {
 	# A download of 0 means the server was unreachable/blocked: flag it so the
 	# UI shows "failed" instead of a misleading "0 Mbps ok".
 	local stt=ok
-	awk -v b="$bd" 'BEGIN{ exit !(b+0 <= 0) }' && stt=fail
-	echo "$w $dl $ul $stt"
+	[ "$ST_DOWN_STATUS" = ok ] && [ "$ST_UP_STATUS" = ok ] || stt=fail
+	st_report "$w" "$dl" "$ul" "$stt"
+}
+
+# Reject HTTP error bodies, transport failures and incomplete directions.
+# Record actual redirect destinations; never store effective URL secrets.
+st_validate() {
+	local dir="$1" direction="$2" streams="$3" i=1 code line rate http bytes elapsed url host sum=0 status=ok hosts=''
+	while [ "$i" -le "$streams" ]; do
+		code=$(cat "$dir/${direction}e$i" 2>/dev/null)
+		read -r rate http bytes elapsed url < "$dir/$direction$i"
+		host=$(st_host "$url")
+		case ";$hosts;" in *";$host;"*) ;; *) hosts="${hosts:+$hosts;}$host" ;; esac
+		if [ "$code" = 0 ] && awk -v h="$http" -v b="$bytes" -v t="$elapsed" -v r="$rate" \
+			'BEGIN{exit !(h>=200 && h<300 && b>0 && t>0 && r>0)}'; then
+			sum=$(awk -v a="$sum" -v b="$rate" 'BEGIN{printf "%.0f",a+b}')
+		else
+			status="http_${http:-000}_exit_${code:-unknown}"
+		fi
+		i=$((i+1))
+	done
+	printf '%s\n' "$status" > "$dir/${direction}status"
+	printf '%s\n' "$hosts" > "$dir/${direction}hosts"
+	[ "$status" = ok ] || sum=0
+	echo "$sum"
 }
 
 # Current in-use throughput on a WAN's device (rx+tx), sampled over ~1s.
@@ -313,7 +469,16 @@ wan_busy_mbps() {
 		'BEGIN{ v=((b-a)+(d-c))*8/1000000; if (v<0) v=0; printf "%.1f", v }'
 }
 
-cmd_speedtest() {
+cmd_speedtest() (
+	flock -n 7 || { echo 'speed test already running' >&2; return 1; }
+	local SPEED_FRESH_FILE="/tmp/multikmwan-fresh.$$" ST_META_FILE="/tmp/multikmwan-source.$$"
+	: > "$SPEED_FRESH_FILE"; : > "$ST_META_FILE"
+	trap 'rm -f "$SPEED_FRESH_FILE" "$ST_META_FILE"' EXIT
+	trap 'exit 1' INT TERM
+	_cmd_speedtest "$@"
+) 7>/var/lock/multikmwan-speed.lock
+
+_cmd_speedtest() {
 	local targets="$*" w line explicit=1 guard thr dev busy prior
 	collect_wans
 	[ -n "$targets" ] || { targets="$WANS"; explicit=0; }
@@ -322,6 +487,7 @@ cmd_speedtest() {
 	local tmp="$SPEED_FILE.$$"
 	echo "# wan down_mbps up_mbps status epoch" > "$tmp"
 	for w in $targets; do
+		[ "$explicit" = 1 ] || ! wan_disabled "$w" || continue
 		# A metered link is skipped unless named on the command line.
 		if [ "$explicit" = 0 ] && wan_metered "$w"; then
 			echo "$w 0 0 metered $(date +%s)" >> "$tmp"
@@ -347,8 +513,11 @@ cmd_speedtest() {
 			fi
 		fi
 		log "speedtest: $w ..."
+		local ST_TEST_EPOCH
+		ST_TEST_EPOCH=$(date +%s)
 		line=$(st_one "$w")
-		echo "$line $(date +%s)" >> "$tmp"
+		echo "$line $ST_TEST_EPOCH" >> "$tmp"
+		echo "$line $ST_TEST_EPOCH" >> "$SPEED_FRESH_FILE"
 		log "speedtest: $line"
 	done
 	mv "$tmp" "$SPEED_FILE"
@@ -368,8 +537,8 @@ hist_record_speed() {
 		[ -n "$w" ] || continue
 		[ "${w#\#}" = "$w" ] || continue
 		[ "$st" = "ok" ] || continue
-		toks="$toks $w:$d:$u"
-	done < "$SPEED_FILE"
+		toks="$toks $w:$d:$u:$e"
+	done < "${SPEED_FRESH_FILE:-$SPEED_FILE}"
 	[ -n "$toks" ] || return 0
 	echo "$now$toks" >> "$SPEEDHIST_FILE"
 	# keep the last HIST_KEEP lines
@@ -377,14 +546,243 @@ hist_record_speed() {
 		&& mv "$SPEEDHIST_FILE.$$" "$SPEEDHIST_FILE"
 }
 
+# ------------------------------------------------------------ website test
+# Bulk throughput alone does not decide which link feels fastest: a slow
+# resolver or a long round trip to the big CDNs hurts every page more than a
+# few Mbps do. So each WAN is also measured on real sites - one DNS lookup and
+# one HTTPS fetch per configured page, bound to that WAN's device - and the
+# "Fastest" ranking blends throughput, page response and DNS (see cmd_score).
+#
+# DNS is measured over DNS-over-HTTPS. A plain UDP lookup goes through
+# dnsmasq and leaves on whichever WAN the main routing table prefers, so it
+# cannot be attributed to one link; a DoH request bound to the device can.
+# Only the request/response leg counts (TCP and TLS setup are subtracted),
+# which is what a UDP query would cost - so the resolver's own hostname,
+# looked up once through dnsmasq and then cached, never enters the figure.
+# The default is a hostname rather than 1.1.1.1 because curl builds on
+# mbedTLS cannot verify IP-address certificates. The answer is then pinned
+# for the page fetch (curl --resolve) so the fetch is that WAN's own path
+# and not dnsmasq's cache.
+# Fetches go out as plain curl. A browser User-Agent without the rest of a
+# browser's request makes Facebook answer 400; with curl's own identity all
+# four default sites answer 2xx/3xx (verified on a GL-AX1800, Sep 2026).
+WEB_DEFAULT_SITES='https://www.facebook.com/ https://www.youtube.com/ https://drive.google.com/ https://www.reddit.com/'
+WEB_DEFAULT_DNS='https://cloudflare-dns.com/dns-query?name={name}&type=A'
+
+web_sites() {
+	local s
+	s=$(g web_sites '')
+	echo "${s:-$WEB_DEFAULT_SITES}"
+}
+
+web_timeout() {
+	local to
+	to=$(g web_timeout 10)
+	case "$to" in ''|*[!0-9]*) to=10 ;; esac
+	[ "$to" -ge 3 ] && [ "$to" -le 60 ] || to=10
+	echo "$to"
+}
+
+# One lookup out of one WAN. Prints "<ms> <ipv4>", or "fail -".
+web_dns() {
+	local dev="$1" name="$2" to="$3" tmpj="$4" url line rc conn app start http st ip
+	url="${DNS_URL:-$WEB_DEFAULT_DNS}"
+	case "$url" in
+		*"{name}"*) url=$(printf '%s' "$url" | sed "s/{name}/$name/g") ;;
+		*) url="${url}${name}" ;;
+	esac
+	rm -f "$tmpj"
+	line=$(curl -s -4 --interface "$dev" --max-time "$to" -H 'accept: application/dns-json' \
+		-o "$tmpj" -w '%{time_connect} %{time_appconnect} %{time_starttransfer} %{http_code}' \
+		"$url" 2>/dev/null); rc=$?
+	set -- $line
+	conn="${1:-0}"; app="${2:-0}"; start="${3:-0}"; http="${4:-000}"
+	st=$(jsonfilter -q -i "$tmpj" -e '@.Status' 2>/dev/null)
+	# A CNAME chain lists several records; the first A record is the one.
+	ip=$(jsonfilter -q -i "$tmpj" -e '@.Answer[*].data' 2>/dev/null |
+		grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}$' | head -1)
+	rm -f "$tmpj"
+	if [ "$rc" = 0 ] && [ "$http" = 200 ] && [ "$st" = 0 ] && [ -n "$ip" ]; then
+		awk -v c="$conn" -v a="$app" -v s="$start" -v ip="$ip" \
+			'BEGIN{ b=(a>c?a:c); ms=(s-b)*1000; if (ms<0) ms=0; printf "%.0f %s\n", ms, ip }'
+	else
+		echo "fail -"
+	fi
+}
+
+# One page out of one WAN. Prints "<first_byte_ms> <page_ms> <http> <status>";
+# times exclude the name lookup. A redirect counts: the site's front door
+# answered, which is the part the link is responsible for.
+web_fetch() {
+	local dev="$1" url="$2" to="$3" name="$4" port="$5" ip="$6" line rc
+	if [ -n "$ip" ] && [ -n "$name" ]; then set -- --resolve "$name:$port:$ip"; else set --; fi
+	line=$(curl -s -4 --interface "$dev" --max-time "$to" -o /dev/null \
+		--proto '=http,https' "$@" \
+		-w '%{time_namelookup} %{time_starttransfer} %{time_total} %{http_code}' "$url" 2>/dev/null); rc=$?
+	awk -v rc="$rc" -v l="$line" 'BEGIN{
+		split(l, f, " "); nl=f[1]+0; st=f[2]+0; tt=f[3]+0; http=f[4]+0
+		ok=(rc==0 && http>=200 && http<400 && st>0)
+		# A failed fetch has no meaningful timings; never print a negative one.
+		fb=(st-nl)*1000; pg=(tt-nl)*1000; if (!ok || fb<0) fb=0; if (!ok || pg<0) pg=0
+		printf "%.0f %.0f %03d %s\n", fb, pg, http, (ok ? "ok" : sprintf("http_%03d_exit_%s", http, rc)) }'
+}
+
+# Every configured site out of one WAN. Appends one row per site to $out
+# (wan host dns_ms first_byte_ms page_ms http status epoch) and prints the
+# WAN's summary row: wan dns_ms first_byte_ms page_ms ok total status epoch.
+# DNS is the median lookup; the page figures are means over loaded sites.
+web_wan() {
+	local w="$1" dev="$2" to="$3" sites="$4" out="$5"
+	local site host name port ip res dnsms n=0 ok=0 dlist='' tlist='' llist='' now tmpj
+	tmpj="/tmp/mkweb.$w.$$"
+	for site in $sites; do
+		case "$site" in http://*|https://*) ;; *) continue ;; esac
+		host=$(st_host "$site")
+		[ -n "$host" ] || continue
+		name="$host"; port=443
+		case "$site" in http://*) port=80 ;; esac
+		# A literal IPv6 host or an explicit port is fetched as-is, unpinned.
+		case "$host" in
+			\[*) name='' ;;
+			*:*) name=${host%%:*}; port=${host##*:} ;;
+		esac
+		n=$((n + 1))
+		now=$(date +%s)
+		ip=''; dnsms='-'
+		if [ -n "$name" ]; then
+			res=$(web_dns "$dev" "$name" "$to" "$tmpj")
+			dnsms=${res%% *}; ip=${res#* }
+			[ "$dnsms" != fail ] || { dnsms='-'; ip=''; }
+		fi
+		res=$(web_fetch "$dev" "$site" "$to" "$name" "$port" "$ip")
+		set -- $res
+		if [ "$4" = ok ]; then
+			ok=$((ok + 1)); tlist="$tlist $1"; llist="$llist $2"
+			[ "$dnsms" = '-' ] || dlist="$dlist $dnsms"
+		fi
+		echo "$w $host $dnsms $1 $2 $3 $4 $now" >> "$out"
+	done
+	awk -v w="$w" -v d="$dlist" -v t="$tlist" -v l="$llist" -v ok="$ok" -v n="$n" -v now="$(date +%s)" 'BEGIN{
+		nd=split(d, dv, " "); nt=split(t, tv, " "); nl=split(l, lv, " ")
+		for (i=1; i<=nt; i++) ts+=tv[i]
+		for (i=1; i<=nl; i++) ls+=lv[i]
+		for (i=2; i<=nd; i++) { x=dv[i]; j=i-1; while (j>0 && dv[j]>x) { dv[j+1]=dv[j]; j-- } dv[j+1]=x }
+		dm=(nd%2 ? dv[(nd+1)/2] : (dv[nd/2]+dv[nd/2+1])/2)
+		printf "%s %s %s %s %d %d %s %d\n", w, (nd ? sprintf("%.0f", dm) : "-"),
+			(nt ? sprintf("%.0f", ts/nt) : "-"), (nl ? sprintf("%.0f", ls/nl) : "-"), ok, n, (ok ? "ok" : "fail"), now }'
+}
+
+cmd_webtest() (
+	# Shares the speed-test lock: two measurements on one link at the same
+	# time would each distort the other.
+	flock -n 7 || { echo 'a speed or website test is already running' >&2; return 1; }
+	trap 'exit 1' INT TERM
+	_cmd_webtest "$@"
+) 7>/var/lock/multikmwan-speed.lock
+
+_cmd_webtest() {
+	local targets="$*" w explicit=1 guard thr dev busy to sites line now
+	local tmpw="$WEB_FILE.$$" tmps="$WEBSITES_FILE.$$"
+	collect_wans
+	[ -n "$targets" ] || { targets="$WANS"; explicit=0; }
+	guard=$(g busy_skip 1); thr=$(g busy_mbps 20)
+	to=$(web_timeout); sites=$(web_sites)
+	DNS_URL=$(g dns_url "$WEB_DEFAULT_DNS")
+	echo "# wan dns_ms first_byte_ms page_ms ok total status epoch" > "$tmpw"
+	echo "# wan host dns_ms first_byte_ms page_ms http status epoch" > "$tmps"
+	for w in $targets; do
+		now=$(date +%s)
+		[ "$explicit" = 1 ] || ! wan_disabled "$w" || continue
+		if [ "$explicit" = 0 ] && wan_metered "$w"; then
+			echo "$w - - - 0 0 metered $now" >> "$tmpw"
+			log "webtest: $w is metered - skipped"
+			continue
+		fi
+		dev=$(wan_dev "$w")
+		[ -n "$dev" ] || { echo "$w - - - 0 0 nodev $now" >> "$tmpw"; continue; }
+		if [ "$explicit" = 0 ] && [ "$guard" = "1" ]; then
+			busy=$(wan_busy_mbps "$dev")
+			if awk -v x="$busy" -v t="$thr" 'BEGIN{ exit !(x+0 > t+0) }'; then
+				# Response times on a loaded link describe the load, not the
+				# link. Carry the last result forward, as the speed test does.
+				web_keep "$w" "$tmpw" "$tmps" "$w - - - 0 0 busy $now"
+				log "webtest: $w busy (${busy} Mbps in use > ${thr}) - skipped"
+				continue
+			fi
+		fi
+		log "webtest: $w ..."
+		line=$(web_wan "$w" "$dev" "$to" "$sites" "$tmps")
+		echo "$line" >> "$tmpw"
+		log "webtest: $line"
+	done
+	# A run naming specific WANs must not erase the others' results.
+	if [ "$explicit" = 1 ]; then
+		for w in $WANS; do
+			case " $targets " in *" $w "*) continue ;; esac
+			web_keep "$w" "$tmpw" "$tmps" ''
+		done
+	fi
+	mv "$tmpw" "$WEB_FILE"
+	mv "$tmps" "$WEBSITES_FILE"
+	cat "$WEB_FILE"
+}
+
+# Copy a WAN's previous summary and site rows into the files being built;
+# $4 is written instead when there is no previous summary (may be empty).
+web_keep() {
+	local w="$1" tmpw="$2" tmps="$3" fallback="$4" prior
+	prior=$(grep "^$w " "$WEB_FILE" 2>/dev/null | head -1)
+	if [ -n "$prior" ]; then echo "$prior" >> "$tmpw"
+	elif [ -n "$fallback" ]; then echo "$fallback" >> "$tmpw"; fi
+	grep "^$w " "$WEBSITES_FILE" 2>/dev/null >> "$tmps"
+}
+
+# Mean ping round trip per WAN over the last $1 seconds, from the monitor's
+# samples (ts,wan,state,rtt,...). Prints "wan ms". Falls back to the latest
+# health line when the monitor has not filled a window yet, e.g. just after
+# boot. Only numeric RTTs count, so a link that was down contributes nothing.
+score_latency() {
+	local win="$1" now
+	now=$(date +%s)
+	case "$win" in ''|*[!0-9]*) win=300 ;; esac
+	{ [ -f "$QUALITY_DIR/samples" ] && tail -n 2000 "$QUALITY_DIR/samples"; } |
+		awk -F, -v now="$now" -v win="$win" \
+			'$1 >= now - win && $4 ~ /^[0-9]+([.][0-9]+)?$/ { s[$2] += $4; n[$2]++ }
+			 END { for (w in n) printf "%s %.1f\n", w, s[w] / n[w] }'
+}
+
+# Composite "fastest" score, best first, from the last speed test, the last
+# website test and recent ping latency (score.awk has the formula). Columns:
+#   composite wan speed_pts dns_pts web_pts speed_mbps dns_ms first_byte_ms down up sites lat_pts lat_ms
+cmd_score() {
+	local by="${1:-$(g rank_by sum)}" ws wd ww wl sf lf
+	case "$by" in down|up|sum) ;; *) by=sum ;; esac
+	ws=$(g score_w_speed 40); ww=$(g score_w_web 25); wl=$(g score_w_latency 20); wd=$(g score_w_dns 15)
+	[ -f "$SPEED_FILE" ] || return 1
+	sf="$WEBSITES_FILE"; [ -f "$sf" ] || sf=/dev/null
+	lf="/tmp/multikmwan.latency.$$"
+	score_latency "$(g score_rtt_window 300)" > "$lf"
+	[ -s "$lf" ] || awk '$2 ~ /^[0-9]+([.][0-9]+)?$/ { print $1, $2 }' "$HEALTH_FILE" 2>/dev/null > "$lf"
+	awk -v by="$by" -v ws="$ws" -v wd="$wd" -v ww="$ww" -v wl="$wl" \
+		-v speed="$SPEED_FILE" -v sites="$sf" -v latency="$lf" \
+		-f "$QUALITY_LIB/score.awk" "$SPEED_FILE" "$sf" "$lf" | sort -rn
+	rm -f "$lf"
+}
+
 # --------------------------------------------------------------- ranking
 # Applies the last speed-test result to kmwan: metrics for failover order,
 # weights for the load-balance ratio.
 
-# Prints "score wan down up", fastest first, from the last speed test.
+# Prints "score wan down up", fastest first. With rank_mode=score (the
+# default) the score is the composite of throughput, page response and DNS;
+# otherwise it is the throughput figure named by $1 (sum|down|up).
 rank_sorted() {
 	local by="$1" w d u st e score
 	[ -f "$SPEED_FILE" ] || return 1
+	if [ "$(g rank_mode score)" = "score" ]; then
+		cmd_score "$by" | awk '{print $1, $2, $9, $10}'
+		return 0
+	fi
 	while read -r w d u st e; do
 		[ -n "$w" ] || continue
 		[ "${w#\#}" = "$w" ] || continue
@@ -470,7 +868,11 @@ cmd_autorank() {
 	margin=$(g auto_margin 15); bytes=$(g auto_bytes 10000000)
 	now=$(date +%s)
 
-	ST_BYTES="$bytes" cmd_speedtest >/dev/null 2>&1
+	ST_BYTES="$bytes" ST_KIND=scheduled cmd_speedtest >/dev/null 2>&1 || return 1
+	# The composite needs fresh page and DNS figures too. The speed test has
+	# just released the shared lock, so this cannot collide with it.
+	[ "$(g rank_mode score)" != "score" ] || cmd_webtest >/dev/null 2>&1 || \
+		log "autorank: website test did not run; using its previous result"
 	sorted=$(rank_sorted "$by")
 	if [ -z "$sorted" ]; then
 		echo "$now no-results -" > "$AUTO_FILE"
@@ -512,8 +914,6 @@ cmd_loop() {
 	day=$(date +%Y-%m-%d)
 	while :; do
 		interval=$(g interval 20)
-		cmd_health >/dev/null 2>&1
-		hist_rollup health >/dev/null 2>&1
 		cmd_sync >/dev/null 2>&1
 		cmd_geo >/dev/null 2>&1
 		ar=$(g auto_rank 0)
@@ -533,6 +933,29 @@ cmd_loop() {
 	done
 }
 
+# Independent procd instance. Work duration is subtracted from the cadence;
+# missed deadlines are visible as gaps instead of invented downtime.
+cmd_monitor() {
+	local interval started elapsed delay
+	while :; do
+		interval=$(health_interval)
+		started=$(date +%s)
+		cmd_health >/dev/null 2>&1
+		elapsed=$(( $(date +%s) - started ))
+		delay=$((interval - elapsed))
+		[ "$delay" -ge 1 ] && [ "$delay" -le "$interval" ] || delay=1
+		sleep "$delay"
+	done
+}
+
+health_interval() {
+	local interval
+	interval=$(g interval 20)
+	case "$interval" in ''|*[!0-9]*) interval=20 ;; esac
+	[ "$interval" -ge 5 ] && [ "$interval" -le 3600 ] || interval=20
+	echo "$interval"
+}
+
 # ------------------------------------------------------------------ health
 # Latency and loss per WAN, pinging out of that WAN's own device so the
 # answer is about that link rather than whichever one routing prefers.
@@ -543,29 +966,81 @@ wan_track_ip() {
 	echo "${t:-1.1.1.1}"
 }
 
-cmd_health() {
-	local w dev tgt out loss rtt now
-	collect_wans
-	now=$(date +%s)
-	local tmp="$HEALTH_FILE.$$"
-	: > "$tmp"
-	for w in $WANS; do
-		dev=$(wan_dev "$w")
-		if [ -z "$dev" ]; then
-			echo "$w - 100 $now" >> "$tmp"
-			continue
-		fi
-		tgt=$(wan_track_ip "$w")
-		out=$(ping -I "$dev" -c 3 -W 1 "$tgt" 2>/dev/null)
-		loss=$(echo "$out" | sed -n 's/.* \([0-9]*\)% packet loss.*/\1/p')
-		rtt=$(echo "$out" | sed -n 's|.*= [0-9.]*/\([0-9.]*\)/.*|\1|p')
-		[ -n "$loss" ] || loss=100
-		[ -n "$rtt" ] || rtt=-
-		echo "$w $rtt $loss $now" >> "$tmp"
-	done
-	mv "$tmp" "$HEALTH_FILE"
-	cat "$HEALTH_FILE"
+health_one() {
+	local w="$1" interval="$2" dev tgt result state reason
+	dev=$(wan_dev "$w")
+	tgt=$(wan_track_ip "$w")
+	# Restrict stored tokens and prevent ping options from a malformed target.
+	case "$tgt" in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9.:-]*) tgt=1.1.1.1 ;; esac
+	[ "${#tgt}" -le 253 ] || tgt=1.1.1.1
+	if [ "$(uci -q get kmwan."$w".disabled)" = 1 ]; then
+		result='- - - 0 0 disabled'; reason=not_tracked
+	elif [ -z "$dev" ]; then
+		result='- 100 - 0 0 down'; reason=no_device
+	elif ! network_is_up "$w"; then
+		result='- 100 - 0 0 down'; reason=link_down
+	else
+		result=$(LC_ALL=C ping -n -4 -I "$dev" -c 3 -W 1 -w 5 "$tgt" 2>/dev/null |
+			awk -f "$QUALITY_LIB/ping.awk")
+		state=${result##* }
+		case "$state" in
+			down) reason=probe_failed ;; degraded) reason=loss_or_latency ;;
+			healthy) reason=probe_ok ;; *) reason=probe_error ;;
+		esac
+	fi
+	set -- $result
+	# Anything but the six probe fields (awk helper missing mid-upgrade, ping
+	# killed) must not shift columns: readers would show the epoch as RTT.
+	[ $# -eq 6 ] || { set -- - - - 0 0 unknown; reason=probe_error; }
+	printf '%s %s %s %s %s %s %s %s %s %s %s\n' "$w" "$1" "$2" "$(date +%s)" \
+		"$3" "$4" "$5" "$6" "$tgt" "$interval" "$reason"
 }
+
+cmd_health() (
+	# Kernel locks release on crashes. Manual refreshes cannot overlap the
+	# monitor or race an RPC reader. Slow speed work uses a different lock.
+	flock -n 9 || return 0
+	mkdir -p "$QUALITY_DIR" || return 1
+	local w count=0 interval tmp work now
+	interval=$(health_interval)
+	work=$(mktemp -d "$QUALITY_DIR/probe.XXXXXX") || return 1
+	tmp="$HEALTH_FILE.$$"
+	trap 'rm -f "$tmp"; rm -rf "$work"' EXIT
+	trap 'exit 1' INT TERM
+	collect_wans
+	for w in $WANS; do
+		case "$w" in ''|*[!A-Za-z0-9_.-]*) continue ;; esac
+		[ "${#w}" -le 64 ] || continue
+		health_one "$w" "$interval" > "$work/$w" &
+		count=$((count+1))
+		# Bound process count even on configurations with many WANs.
+		[ $((count % 4)) -eq 0 ] && wait
+	done
+	wait
+	: > "$tmp"
+	for w in "$work"/*; do [ -f "$w" ] && cat "$w" >> "$tmp"; done
+	mv "$tmp" "$HEALTH_FILE" || return 1
+	now=$(date +%s)
+	exec 6>/var/lock/multikmwan-quality.lock
+	flock_wait 6 2 || return 1
+	touch "$QUALITY_DIR/state" "$QUALITY_DIR/samples" "$QUALITY_DIR/events"
+	: > "$QUALITY_DIR/state.next"
+	awk -v previous="$QUALITY_DIR/state" -v nextstate="$QUALITY_DIR/state.next" \
+		-v samples="$QUALITY_DIR/samples" -v events="$QUALITY_DIR/events" \
+		-f "$QUALITY_LIB/quality-update.awk" "$QUALITY_DIR/state" "$HEALTH_FILE" || return 1
+	mv "$QUALITY_DIR/state.next" "$QUALITY_DIR/state"
+	# Numeric/token-only records are at most 512 bytes. Caps bound RAM use
+	# across any number of WANs; pruned periods appear as missing coverage.
+	awk -F, -v now="$now" '$1>=now-86400 && $1<=now && length($0)<=512' \
+		"$QUALITY_DIR/samples" | tail -n 16384 > "$QUALITY_DIR/samples.next"
+	mv "$QUALITY_DIR/samples.next" "$QUALITY_DIR/samples"
+	awk -F, -v now="$now" '$1>=now-86400 && $1<=now' "$QUALITY_DIR/events" |
+		tail -n 512 > "$QUALITY_DIR/events.next"
+	mv "$QUALITY_DIR/events.next" "$QUALITY_DIR/events"
+	flock -u 6
+	hist_rollup health
+	cat "$HEALTH_FILE"
+) 9>/var/lock/multikmwan-health.lock
 
 # --------------------------------------------------------------------- geo
 # Public IP, ISP and rough location per WAN. Cached for 6h: the lookup is
@@ -627,7 +1102,12 @@ cmd_geo() {
 
 # Fold the latest health OR speed results into today's accumulator rows.
 # One awk invocation; state/outage edges tracked via STATE_FILE.
-hist_rollup() {
+hist_rollup() (
+	flock_wait 8 5 || return 1
+	_hist_rollup "$@"
+) 8>/var/lock/multikmwan-history.lock
+
+_hist_rollup() {
 	local kind="$1" today
 	today=$(date +%Y-%m-%d)
 	[ -f "$ACC_FILE" ]   || : > "$ACC_FILE"
@@ -645,7 +1125,7 @@ hist_rollup() {
 			}
 			# 3) health lines: wan rtt loss epoch
 			{
-				w=$1; rtt=$2; loss=$3; if(w=="")next
+				w=$1; rtt=$2; loss=$3; if(w=="" || $8=="disabled" || $8=="unknown")next
 				have[w]=1
 				if (loss=="100" || rtt=="-") {
 					A[w",4"]++                              # down
@@ -699,17 +1179,30 @@ hist_rollup() {
 					print line > AO
 				}
 			}
-		' AF="$ACC_FILE" AO="$ACC_FILE.$$" "$ACC_FILE" "$SPEED_FILE" >/dev/null 2>&1
+		' AF="$ACC_FILE" AO="$ACC_FILE.$$" "$ACC_FILE" "${SPEED_FRESH_FILE:-$SPEED_FILE}" >/dev/null 2>&1
 		[ -f "$ACC_FILE.$$" ] && mv "$ACC_FILE.$$" "$ACC_FILE"
+		if [ -s "$ST_META_FILE" ]; then
+			[ -f /tmp/multikmwan-tests.csv ] || cp "$HIST_DIR/tests.csv" /tmp/multikmwan-tests.csv 2>/dev/null
+			cat /tmp/multikmwan-tests.csv "$ST_META_FILE" 2>/dev/null | tail -n 256 > /tmp/multikmwan-tests.next
+			mv /tmp/multikmwan-tests.next /tmp/multikmwan-tests.csv
+		fi
 	fi
 }
 
 # Merge the accumulator into flash, clear it, prune > HIST_DAYS. Called on a
 # cadence and on date change, so flash sees ~hourly writes at most.
-hist_flush() {
+hist_flush() (
+	flock_wait 8 5 || return 1
+	_hist_flush
+) 8>/var/lock/multikmwan-history.lock
+
+_hist_flush() {
 	local cutoff
-	[ -s "$ACC_FILE" ] || return 0
 	mkdir -p "$HIST_DIR"
+	if [ -f /tmp/multikmwan-tests.csv ]; then
+		cp /tmp/multikmwan-tests.csv "$HIST_DIR/tests.csv.next" && mv "$HIST_DIR/tests.csv.next" "$HIST_DIR/tests.csv"
+	fi
+	[ -s "$ACC_FILE" ] || return 0
 	cutoff=$(date -d "-${HIST_DAYS} days" +%Y-%m-%d 2>/dev/null)
 	[ -f "$HIST_FILE" ] || : > "$HIST_FILE"
 	awk -F, '
@@ -726,7 +1219,7 @@ hist_flush() {
 			split(k,p,","); line=p[1]","p[2]; for(i=3;i<=15;i++) line=line","(A[k","i]+0); print line } }
 	' OFS=, "$ACC_FILE" "$HIST_FILE" | \
 		awk -F, -v c="$cutoff" '(c=="" || $1>=c)' | sort -t, -k1,1 -k2,2 > "$HIST_FILE.$$" \
-		&& mv "$HIST_FILE.$$" "$HIST_FILE"
+		&& mv "$HIST_FILE.$$" "$HIST_FILE" || return 1
 	: > "$ACC_FILE"
 }
 
@@ -783,6 +1276,10 @@ cmd_status() {
 	ip rule show
 	echo "--- speed ---"
 	cat "$SPEED_FILE" 2>/dev/null || echo "(no results)"
+	echo "--- websites ---"
+	cat "$WEB_FILE" 2>/dev/null || echo "(no results)"
+	echo "--- score ---"
+	cmd_score 2>/dev/null || echo "(no results)"
 	echo "--- health ---"
 	cat "$HEALTH_FILE" 2>/dev/null || echo "(no results)"
 	echo "--- geo ---"
@@ -794,6 +1291,8 @@ case "$1" in
 	flush)     cmd_flush ;;
 	mode)      shift; cmd_mode "$@" ;;
 	speedtest) shift; cmd_speedtest "$@" ;;
+	webtest)   shift; cmd_webtest "$@" ;;
+	score)     shift; cmd_score "$@" ;;
 	rank)      shift; cmd_rank "$@" ;;
 	check)     cmd_check ;;
 	health)    cmd_health ;;
@@ -801,8 +1300,10 @@ case "$1" in
 	history)   cmd_history ;;
 	hist-flush) hist_flush ;;
 	loop)      cmd_loop ;;
+	monitor)   cmd_monitor ;;
 	geo)       shift; cmd_geo "$@" ;;
 	status)    cmd_status ;;
+	test-source) st_config; printf '%s|%s|%s|%s\n' "$ST_LABEL" "$ST_PROFILE" "$ST_HOST_DOWN" "$ST_HOST_UP" ;;
 	*)
 		cat <<USAGE
 multikmwan - per-client WAN preference + speed ranking for GL kmwan
@@ -812,10 +1313,12 @@ multikmwan - per-client WAN preference + speed ranking for GL kmwan
   multikmwan flush                    remove everything multikmwan installed
   multikmwan mode [failover|balancing]  get/set kmwan mode
   multikmwan speedtest [wan ...]      measure down/up per WAN (binds to each dev)
+  multikmwan webtest [wan ...]        DNS lookup + page response per WAN, on real sites
+  multikmwan score [sum|down|up]      composite ranking: throughput + page response + DNS
   multikmwan rank [sum|down|up] [both|metric|weight]
-                                   apply last speed test to kmwan
+                                   apply the ranking to kmwan
   multikmwan health                   ping latency/loss out of each WAN
-  multikmwan autorank                 re-test (small payload) and re-rank if the leader changed
+  multikmwan autorank                 re-test speed + websites and re-rank if the leader changed
   multikmwan history                  print the 90-day daily history CSV
   multikmwan geo [force]              public IP / ISP / location per WAN
   multikmwan status                   kmwan status + rules + last speed results

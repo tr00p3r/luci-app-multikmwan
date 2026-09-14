@@ -2,11 +2,11 @@
 	"luci-app-multikmwan": {
 		"description": "MultiKmwan (kmwan front-end)",
 		"read": {
-			"ubus": { "luci.multikmwan": [ "status", "check", "clients", "history", "stservers" ] },
+			"ubus": { "luci.multikmwan": [ "status", "check", "clients", "history", "quality", "stservers" ] },
 			"uci": [ "multikmwan", "kmwan", "network", "firewall", "dhcp" ]
 		},
 		"write": {
-			"ubus": { "luci.multikmwan": [ "sync", "speedtest", "rank", "setmode", "health", "geo", "add_server", "applymode" ] },
+			"ubus": { "luci.multikmwan": [ "sync", "speedtest", "webtest", "rank", "setmode", "health", "geo", "add_server", "applymode" ] },
 			"uci": [ "multikmwan", "kmwan" ]
 		}
 	}

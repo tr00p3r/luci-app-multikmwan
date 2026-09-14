@@ -1,5 +1,5 @@
 Package: luci-app-multikmwan
-Version: 1.0.0-1
+Version: 1.1.0-1
 Depends: luci-base, curl
 Section: luci
 Category: LuCI

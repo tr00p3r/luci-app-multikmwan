@@ -21,7 +21,7 @@ return view.extend({
 		var hosts = (data[2] && data[2].clients) || [];
 		var m, s, o;
 
-		m = new form.Map('multikmwan', _('Client Preference'),
+		m = new form.Map('multikmwan', _('Devices'),
 			_('Pick a device and choose which WAN it should use. If that WAN goes ' +
 			  'down the device falls through to its next choice automatically. ' +
 			  'Anything not listed here just follows the router\'s normal mode.'));
@@ -64,7 +64,8 @@ return view.extend({
 
 		o = s.option(form.ListValue, 'mode', _('Use'),
 			_('Pick specific WANs, or a role that follows measurements: Fastest / ' +
-			  'Slowest track the latest speed test; Backup uses metered links first.'));
+			  'Slowest track the latest ranking (throughput, website response and ' +
+			  'DNS, as set on the Settings page); Backup uses metered links first.'));
 		o.value('order', _('Specific WANs'));
 		o.value('fastest', _('Fastest link (auto)'));
 		o.value('slowest', _('Slowest link (auto)'));

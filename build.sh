@@ -4,14 +4,7 @@
 set -e
 cd "$(dirname "$0")"
 
-VER=$(sed -n 's/^Version: //p' control/control)
-OUT="luci-app-multikmwan_${VER}_all.ipk"
-TMP=$(mktemp -d)
-
-mkdir -p "$TMP/data/www" "$TMP/control"
-cp -r root/.   "$TMP/data/"
-cp -r htdocs/. "$TMP/data/www/"
-cp control/*   "$TMP/control/"
-
-python pack_ipk.py "$TMP" "$OUT"
-rm -rf "$TMP"
+if command -v python3 >/dev/null 2>&1; then
+	exec python3 build.py
+fi
+exec python build.py

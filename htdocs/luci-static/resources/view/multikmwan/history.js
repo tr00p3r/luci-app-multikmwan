@@ -1,6 +1,7 @@
 'use strict';
 'require view';
 'require rpc';
+'require multikmwan';
 
 var callHistory = rpc.declare({ object: 'luci.multikmwan', method: 'history' });
 
@@ -81,6 +82,7 @@ return view.extend({
 	load: function() { return callHistory().catch(function() { return { days: [] }; }); },
 
 	render: function(data) {
+		if (data && data.error) return E('p', { role: 'alert' }, data.error);
 		var days = (data && data.days) || [];
 		var g = group(days);
 		var wans = Object.keys(g.byWan);
@@ -96,6 +98,11 @@ return view.extend({
 				'Uptime is the share of health checks that answered; speeds are from ' +
 				'the periodic tests.'))
 		]);
+		body.appendChild(E('details', {}, [
+			E('summary', {}, _('Speed tests by source (last 256 results)')),
+			E('p', {}, _('Each result retains its original profile name and actual endpoint hosts. Daily totals combine sources. Recent results are checkpointed hourly and may be lost on sudden power failure.')),
+			multikmwan.testTable(data.testhistory)
+		]));
 
 		if (!wans.length) {
 			body.appendChild(E('div', { 'class': 'mh-empty' },

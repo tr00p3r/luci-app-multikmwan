@@ -3,6 +3,10 @@
 chmod +x /usr/sbin/multikmwan
 chmod +x /usr/libexec/rpcd/luci.multikmwan
 chmod +x /etc/init.d/multikmwan
+# Locking uses flock, a BusyBox applet on OpenWrt and GL.iNet firmware. It is
+# not declared as a package dependency: the util-linux flock package is absent
+# from GL.iNet feeds, which would make this package uninstallable there.
+command -v flock >/dev/null 2>&1 || echo "WARNING: flock not found - install the flock package or enable it in busybox"
 chmod +x /etc/hotplug.d/iface/95-multikmwan
 chmod +x /etc/uci-defaults/99-multikmwan 2>/dev/null
 # seed defaults now (and let it self-remove) so settings exist immediately
@@ -11,7 +15,7 @@ rm -f /tmp/luci-indexcache* 2>/dev/null
 rm -rf /tmp/luci-modulecache 2>/dev/null
 /etc/init.d/rpcd restart >/dev/null 2>&1
 /etc/init.d/multikmwan enable >/dev/null 2>&1
-/etc/init.d/multikmwan start >/dev/null 2>&1
+/etc/init.d/multikmwan restart >/dev/null 2>&1
 echo ""
 echo "luci-app-multikmwan installed."
 echo "  UI:            Network -> MultiKmwan"

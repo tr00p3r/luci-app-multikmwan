@@ -25,6 +25,17 @@ set multikmwan.global.auto_margin=15
 set multikmwan.global.st_streams=4
 set multikmwan.global.busy_skip=1
 set multikmwan.global.busy_mbps=20
+set multikmwan.global.rank_mode=score
+set multikmwan.global.score_w_speed=40
+set multikmwan.global.score_w_web=25
+set multikmwan.global.score_w_latency=20
+set multikmwan.global.score_w_dns=15
+set multikmwan.global.dns_url=https://cloudflare-dns.com/dns-query?name={name}&type=A
+set multikmwan.global.web_timeout=10
+add_list multikmwan.global.web_sites=https://www.facebook.com/
+add_list multikmwan.global.web_sites=https://www.youtube.com/
+add_list multikmwan.global.web_sites=https://drive.google.com/
+add_list multikmwan.global.web_sites=https://www.reddit.com/
 EOF
 	uci commit multikmwan
 fi
@@ -38,6 +49,19 @@ set multikmwan.cloudflare=server
 set multikmwan.cloudflare.label=Cloudflare
 set multikmwan.cloudflare.down_url=https://speed.cloudflare.com/__down?bytes={bytes}
 set multikmwan.cloudflare.up_url=https://speed.cloudflare.com/__up
+EOF
+	uci commit multikmwan
+fi
+
+# A real-content profile: "speed test Facebook" pulls the site's own assets
+# from its CDN. Seeded once, on new and existing installs alike, only if no
+# profile with this id exists; it is not made the active server here.
+if [ -z "$(uci -q get multikmwan.facebook)" ]; then
+	uci -q batch <<'EOF'
+set multikmwan.facebook=server
+set multikmwan.facebook.label='Facebook (real content)'
+set multikmwan.facebook.kind=page
+set multikmwan.facebook.down_url=https://www.facebook.com/
 EOF
 	uci commit multikmwan
 fi

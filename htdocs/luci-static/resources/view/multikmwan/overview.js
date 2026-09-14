@@ -1,12 +1,14 @@
 'use strict';
 'require view';
 'require rpc';
+'require multikmwan';
 'require ui';
 'require poll';
 
 var callStatus = rpc.declare({ object: 'luci.multikmwan', method: 'status' });
 var callSync   = rpc.declare({ object: 'luci.multikmwan', method: 'sync' });
 var callSpeed  = rpc.declare({ object: 'luci.multikmwan', method: 'speedtest' });
+var callWeb    = rpc.declare({ object: 'luci.multikmwan', method: 'webtest' });
 var callGeo    = rpc.declare({ object: 'luci.multikmwan', method: 'geo' });
 var callHealth = rpc.declare({ object: 'luci.multikmwan', method: 'health' });
 var callRank   = rpc.declare({ object: 'luci.multikmwan', method: 'rank',
@@ -32,6 +34,8 @@ var CSS = '' +
 '.mk-stat span{display:block;font-size:.7em;text-transform:uppercase;' +
 'letter-spacing:.05em;opacity:.6}' +
 '.mk-stat b{font-size:1.05em;font-weight:600}' +
+'.mk-stat.mk-score b{font-size:1.25em}' +
+'.mk-sites td,.mk-sites th{white-space:nowrap}' +
 '.mk-speed{font-size:.88em;display:flex;gap:12px;align-items:baseline;margin-top:4px}' +
 '.mk-speed b{font-weight:600}' +
 '.mk-dim{opacity:.55;font-size:.9em}' +
@@ -56,6 +60,22 @@ var prev = {};
 
 function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
 function fmt1(v) { var n = num(v); return n === null ? '-' : n.toFixed(1); }
+function fmtMs(v) { var n = num(v); return n === null ? '-' : String(Math.round(n)); }
+
+// The composite is on unless the user picked "Throughput only".
+function compositeOn(d) { return !d.rank || d.rank.mode !== 'speed'; }
+
+// Tooltip spelling out how a WAN's score was built, e.g.
+// "throughput 0.85 x 50% + website 1.00 x 30% + DNS 0.70 x 20%".
+function scoreTitle(sc, rank) {
+	var r = rank || {};
+	function part(label, pts, w) { return label + ' ' + (num(pts) === null ? '-' : num(pts).toFixed(2)) + ' \u00d7 ' + (w || '?') + '%'; }
+	return part(_('throughput'), sc.speed_pts, r.w_speed) + ' + ' +
+		part(_('website'), sc.web_pts, r.w_web) + ' + ' + part(_('latency'), sc.lat_pts, r.w_latency) +
+		' + ' + part(_('DNS'), sc.dns_pts, r.w_dns) +
+		(num(sc.sites) ? '  (' + sc.sites + _(' sites compared') + ')' : '') +
+		(num(sc.latency) !== null ? '  ' + _('ping ') + fmtMs(sc.latency) + ' ms' : '');
+}
 // Speeds: whole numbers at 10 Mbps and up, one decimal below 10.
 function fmtSpeed(v) {
 	var n = num(v);
@@ -85,10 +105,13 @@ function mbps(bytes, secs) { return secs > 0 ? bytes * 8 / secs / 1e6 : 0; }
 
 // Grade a WAN from several signals so kmwan's transient DEAD (it re-probes
 // for ~7s after every restart) shows as "checking", not an outage.
-function grade(w) {
+function grade(w, now, interval) {
+	if (w.disabled === '1') return { cls: 'idle', label: _('not tracked'), note: _('disabled in kmwan') };
 	if (!w.link)          return { cls: 'down', label: _('down'),        note: _('interface is down') };
 	if (!w.up)            return { cls: 'down', label: _('no route'),    note: _('no default route on this link') };
-	if (w.disabled === '1') return { cls: 'idle', label: _('not tracked'), note: _('disabled in kmwan - enable it on Mode & Priority') };
+	var age = now - (num(w.health_epoch) || 0);
+	if (!num(w.health_epoch) || age < 0 || age > 3 * interval || num(w.loss) === null)
+		return { cls: 'idle', label: _('unknown'), note: _('Health measurements are missing or stale') };
 	if (w.metered === '1' && w.mode === 'balancing' && num(w.weight) === 0)
 		return { cls: 'idle', label: _('backup - unused'), note: _('ratio 0 is never used in balance mode; switch to failover for a last resort') };
 	var loss = num(w.loss), rtt = num(w.rtt);
@@ -107,15 +130,19 @@ return view.extend({
 	renderWans: function(d) {
 		var now = num(d.now) || Math.floor(Date.now() / 1000);
 		var tnow = Date.now() / 1000;
-		var speeds = {}, maxd = 0;
+		var speeds = {}, maxd = 0, webs = {}, scores = {}, composite = compositeOn(d);
 		(d.speed || []).forEach(function(s) {
+			s.source = (d.testhistory || []).filter(function(t) { return t.wan === s.name && t.epoch === s.epoch; }).pop();
 			speeds[s.name] = s;
 			if (s.status === 'ok') maxd = Math.max(maxd, num(s.down) || 0);
 		});
+		(d.web || []).forEach(function(x) { webs[x.name] = x; });
+		(d.scores || []).forEach(function(x) { scores[x.name] = x; });
 
-		return E('div', { 'class': 'mk-grid' }, (d.wans || []).map(function(w) {
+		var hidden = (d.wans || []).filter(function(w) { return w.disabled === '1'; }).map(function(w) { return w.name; });
+		var grid = E('div', { 'class': 'mk-grid' }, (d.wans || []).filter(function(w) { return w.disabled !== '1'; }).map(function(w) {
 			w.mode = d.mode;
-			var g  = grade(w);
+			var g  = grade(w, now, num(d.health_interval) || 20);
 			var sp = speeds[w.name], spNote = null;
 			if (sp && sp.status !== 'ok') {
 				spNote = (sp.status === 'metered') ? _('metered - not speed tested') : _('last speed test failed');
@@ -123,6 +150,18 @@ return view.extend({
 			}
 			if (!spNote) spNote = (w.metered === '1') ? _('metered - not speed tested') : _('no speed test yet');
 			var pct = (sp && maxd > 0) ? (num(sp.down) || 0) / maxd * 100 : 0;
+
+			// Website test: DNS + first-byte per WAN, or why there is none.
+			var wb = webs[w.name], wbNote = null;
+			if (wb && wb.status !== 'ok') {
+				wbNote = (wb.status === 'metered') ? _('metered - websites not tested')
+					: (wb.status === 'busy') ? _('website test skipped - link was busy')
+					: (wb.status === 'nodev') ? _('no device - websites not tested')
+					: _('last website test failed');
+				wb = null;
+			}
+			if (!wbNote) wbNote = (w.metered === '1') ? _('metered - websites not tested') : _('no website test yet');
+			var sc = scores[w.name];
 
 			var rx = num(w.rx_bytes) || 0, tx = num(w.tx_bytes) || 0, live = null, p = prev[w.name];
 			if (p && tnow > p.t + 0.5)
@@ -142,6 +181,8 @@ return view.extend({
 					: E('span', { 'class': 'mk-dim' }, _('location not looked up yet')))
 			];
 			if (g.note) meta.push(E('div', { 'class': 'mk-note' }, g.note));
+			if (speeds[w.name]) meta.push(E('div', { 'class': 'mk-note' },
+				_('Test source: ') + multikmwan.sourceText(speeds[w.name].source)));
 
 			return E('div', { 'class': 'mk-card',
 				'style': 'border-left-color:' + (w.color || '#888') }, [
@@ -154,6 +195,9 @@ return view.extend({
 				]),
 				E('div', { 'class': 'mk-meta' }, meta),
 				E('div', { 'class': 'mk-stats' }, [
+					E('div', { 'class': 'mk-stat mk-score', 'title': (sc && composite) ? scoreTitle(sc, d.rank) : '' }, [
+						E('span', {}, _('score')),
+						E('b', {}, (sc && composite && num(sc.score) !== null) ? String(Math.round(num(sc.score))) : '-') ]),
 					E('div', { 'class': 'mk-stat' }, [ E('span', {}, _('latency')),
 						E('b', {}, num(w.rtt) !== null ? fmt1(w.rtt) + ' ms' : '-') ]),
 					E('div', { 'class': 'mk-stat' }, [ E('span', {}, _('loss')),
@@ -171,12 +215,21 @@ return view.extend({
 				E('div', { 'class': 'mk-bar' }, [
 					E('span', { 'style': 'width:' + pct.toFixed(0) + '%' })
 				]),
+				E('div', { 'class': 'mk-speed' }, wb
+					? [ E('span', {}, [ _('DNS '), E('b', {}, fmtMs(wb.dns)), ' ms' ]),
+					    E('span', {}, [ _('sites '), E('b', {}, fmtMs(wb.ttfb)), _(' ms to first byte') ]),
+					    E('span', { 'class': 'mk-dim' }, wb.ok + '/' + wb.total + _(' sites, ') + ago(wb.epoch, now)) ]
+					: [ E('span', { 'class': 'mk-dim' }, wbNote) ]),
 				E('div', { 'class': 'mk-foot' },
 					_('priority ') + (w.metric || '?') + '  ·  ' + _('ratio ') + (w.weight || '1') +
 					(w.probe_tx ? '  ·  ' + _('kmwan probes ') + w.probe_rx + '/' + w.probe_tx : '') +
 					(w.health_epoch ? '  ·  ' + _('checked ') + ago(w.health_epoch, now) : ''))
 			]);
 		}));
+		if (!hidden.length) return grid;
+		return E('div', {}, [ grid, E('p', { 'class': 'mk-dim' },
+			_('Disabled in kmwan and not shown: ') + hidden.join(', ') +
+			_('. Enable them on the Settings page to track and test them.')) ]);
 	},
 
 	renderRules: function(d) {
@@ -186,7 +239,7 @@ return view.extend({
 
 		if (!clients.length)
 			return E('div', { 'class': 'mk-dim' },
-				_('No client rules configured. Add devices on the Client Preference page.'));
+				_('No client rules configured. Add devices on the Devices page.'));
 
 		var prefOff = (d.enabled !== '1');
 		var roleLabel = { fastest: _('Fastest link'), slowest: _('Slowest link'), backup: _('Backup link') };
@@ -194,7 +247,7 @@ return view.extend({
 			var role = c.mode && c.mode !== 'order' ? c.mode : null;
 			var order = (c.order || '').trim().split(/\s+/).filter(Boolean);
 			// enabled defaults to on: only an explicit '0' means off (matches the
-			// engine's config_get_bool default and the Client Preference page).
+			// engine's config_get_bool default and the Devices page).
 			var off = (c.enabled === '0');
 			var badge = off
 				? { t: _('off'), cls: 'mk-idle' }
@@ -218,7 +271,7 @@ return view.extend({
 		var kids = [];
 		if (prefOff)
 			kids.push(E('div', { 'class': 'mk-note' },
-				_('Client preference is OFF — these rules are not applied. Turn it on on the Client Preference page.')));
+				_('Client preference is OFF — these rules are not applied. Turn it on on the Devices page.')));
 		kids.push(E('div', { 'class': 'mk-clients' }, rows));
 		return E('div', {}, kids);
 	},
@@ -256,7 +309,9 @@ return view.extend({
 				var v = rec ? (num(rec[metric]) || 0) : 0;
 				var h = v / maxv * plotH;
 				kids.push(el('rect', { x: gx + bi * barW, y: padT + plotH - h,
-					width: Math.max(2, barW - 1), height: h, fill: color[wn], rx: 1 }, []));
+					width: Math.max(2, barW - 1), height: h, fill: color[wn], rx: 1 }, [
+					el('title', {}, [document.createTextNode(wn + ': ' + fmtSpeed(v) + ' Mbps · ' +
+						multikmwan.sourceText(rec && rec.source))]) ]));
 			});
 			var lbl = ago(r.epoch, now).replace(_(' min ago'), 'm')
 				.replace(_(' h ago'), 'h').replace(_(' d ago'), 'd').replace(_('just now'), 'now');
@@ -274,9 +329,20 @@ return view.extend({
 	// Download + upload charts of the last few speed runs, side by side.
 	renderGraph: function(d) {
 		var runs = (d.speedhist || []);
+		// Rows for links disabled in kmwan (recorded before scheduled tests
+		// learned to skip them) are noise here; the History page keeps them.
+		var off = {};
+		(d.wans || []).forEach(function(w) { if (w.disabled === '1') off[w.name] = true; });
+		d.testhistory = (d.testhistory || []).filter(function(t) { return !off[t.wan]; });
+		runs.forEach(function(run) {
+			(run.wans || []).forEach(function(test) {
+				test.source = (d.testhistory || []).filter(function(t) { return t.wan === test.name && t.epoch === test.epoch; }).pop();
+			});
+		});
 		if (!runs.length)
-			return E('div', { 'class': 'mk-dim' },
-				_('No speed tests recorded yet. Run one above; the last 10 appear here.'));
+			return E('div', {}, [ E('p', { 'class': 'mk-dim' },
+				_('No successful speed tests recorded yet.')),
+				multikmwan.testTable(d.testhistory, 10) ]);
 		var now = num(d.now) || Math.floor(Date.now() / 1000);
 		var palette = ['#2a6fb5', '#1f8b4c', '#d9a400', '#b3312c', '#7a4fb5', '#0f8b8b'];
 		// Colours come from the backend (stable per WAN across every page).
@@ -304,8 +370,56 @@ return view.extend({
 					E('div', { 'class': 'mk-chart-h' }, _('Upload')),
 					this._barChart(runs, 'up', _('Mbps'), color, wans, now) ])
 			]),
-			legend
+			legend,
+			E('p', { 'class': 'mk-dim' }, _('Transfer tests use the listed cloud service or custom host; these are not official provider speed scores. Daily averages can include different sources.')),
+			multikmwan.testTable(d.testhistory, 10)
 		]);
+	},
+
+	// Per-site results as a grid: one row per site, one column per WAN.
+	renderSites: function(d) {
+		var rows = d.websites || [];
+		if (!rows.length)
+			return E('p', { 'class': 'mk-dim' },
+				_('No website test yet. Use "Test websites", or wait for the next auto-rank.'));
+		var wans = [], seen = {}, hosts = [], hseen = {}, cell = {};
+		(d.wans || []).forEach(function(w) { if (w.disabled === '1') seen[w.name] = true; });
+		(d.wans || []).forEach(function(w) { if (!seen[w.name]) { seen[w.name] = true; wans.push(w.name); } });
+		rows.forEach(function(r) {
+			if (!seen[r.name]) { seen[r.name] = true; wans.push(r.name); }
+			if (!hseen[r.host]) { hseen[r.host] = true; hosts.push(r.host); }
+			cell[r.name + '|' + r.host] = r;
+		});
+		var head = E('tr', {}, [ E('th', {}, _('Site')) ].concat(wans.map(function(n) { return E('th', {}, n); })));
+		var body = hosts.map(function(h) {
+			return E('tr', {}, [ E('td', {}, h) ].concat(wans.map(function(n) {
+				var r = cell[n + '|' + h];
+				if (!r) return E('td', { 'class': 'mk-dim' }, '-');
+				if (r.status !== 'ok') return E('td', { 'class': 'mk-note' }, _('failed') + ' (' + r.status + ')');
+				return E('td', {}, _('DNS ') + fmtMs(r.dns) + '  ·  ' + _('first byte ') + fmtMs(r.ttfb) +
+					'  ·  ' + _('page ') + fmtMs(r.load) + ' ms');
+			})));
+		});
+		return E('div', {}, [
+			E('div', { 'style': 'overflow-x:auto' }, E('table', { 'class': 'table mk-sites' }, [
+				E('thead', {}, head), E('tbody', {}, body) ])),
+			E('p', { 'class': 'mk-dim' }, _('Each cell is one DNS-over-HTTPS lookup and one page fetch made ' +
+				'from the router over that WAN. DNS is the resolver round trip; first byte is connect, TLS ' +
+				'and the server\'s response; page is the full HTML download. A redirect counts as a response. ' +
+				'Only sites that every link loaded are compared for the score.'))
+		]);
+	},
+
+	// One line explaining what "fastest" means right now.
+	rankText: function(d) {
+		var r = d.rank || {};
+		if (!compositeOn(d)) {
+			var by = { down: _('download'), up: _('upload') }[r.by] || _('download + upload');
+			return _('Fastest = throughput only (') + by + ')';
+		}
+		return _('Fastest = throughput ') + (r.w_speed || 40) + '%  ·  ' + _('website response ') +
+			(r.w_web || 25) + '%  ·  ' + _('latency ') + (r.w_latency || 20) + '%  ·  ' +
+			_('DNS ') + (r.w_dns || 15) + '%';
 	},
 
 	modeText: function(d) {
@@ -319,6 +433,7 @@ return view.extend({
 			t += '   ·   ' + _('auto-rank every ') + ar + _(' min')
 				+ (a.epoch ? ' (' + _('last: ') + (a.decision || '?') + ', ' + ago(a.epoch, now) + ')' : '');
 		if (d.enabled !== '1') t += '   ·   ' + _('client preference off');
+		t += '   ·   ' + this.rankText(d);
 		return t;
 	},
 
@@ -341,13 +456,22 @@ return view.extend({
 					})
 				}, _('Run speed test')),
 				E('button', {
+					'class': 'cbi-button cbi-button-action',
+					'click': ui.createHandlerFn(this, function() {
+						ui.addNotification(null, E('p', _('Website test running - a DNS lookup and ' +
+							'a page fetch per site, per WAN. Results appear on the cards as they finish.')), 'info');
+						return callWeb();
+					})
+				}, _('Test websites')),
+				E('button', {
 					'class': 'cbi-button cbi-button-apply',
 					'click': ui.createHandlerFn(this, function() {
-						return callRank('sum', 'both').then(function(r) {
+						// Empty "by" = the configured measure, the same one auto-rank uses.
+						return callRank('', 'both').then(function(r) {
 							ui.addNotification(null, E('pre', (r && r.result) || _('ranked')), 'info');
 						});
 					})
-				}, _('Rank WANs by measured speed')),
+				}, _('Rank WANs now')),
 				E('button', {
 					'class': 'cbi-button cbi-button-neutral',
 					'click': ui.createHandlerFn(this, function() {
@@ -375,8 +499,12 @@ return view.extend({
 				}, _('Sync client rules'))
 			]),
 
+			E('p', { 'id': 'mk-test-source', 'class': 'mk-note' }, _('Next test source: ') + multikmwan.sourceText(d.test_source)),
 			E('h3', {}, _('Recent speed tests')),
 			E('div', { 'id': 'mk-graph' }, this.renderGraph(d)),
+
+			E('h3', {}, _('Website response')),
+			E('div', { 'id': 'mk-sites' }, this.renderSites(d)),
 
 			E('h3', {}, _('Active client rules')),
 			E('div', { 'id': 'mk-rules' }, this.renderRules(d))
@@ -388,10 +516,14 @@ return view.extend({
 				var r = document.getElementById('mk-rules');
 				var m = document.getElementById('mk-mode');
 				var g = document.getElementById('mk-graph');
+				var s = document.getElementById('mk-sites');
+				var source = document.getElementById('mk-test-source');
+				if (source) source.textContent = _('Next test source: ') + multikmwan.sourceText(nd.test_source);
 				if (c) { c.innerHTML = ''; c.appendChild(self.renderWans(nd)); }
 				if (r) { r.innerHTML = ''; r.appendChild(self.renderRules(nd)); }
 				if (m) m.textContent = self.modeText(nd);
 				if (g) { g.innerHTML = ''; g.appendChild(self.renderGraph(nd)); }
+				if (s) { s.innerHTML = ''; s.appendChild(self.renderSites(nd)); }
 			});
 		}, 5);
 

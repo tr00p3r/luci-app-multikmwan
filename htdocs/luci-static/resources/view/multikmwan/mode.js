@@ -13,6 +13,12 @@ var callStServers = rpc.declare({ object: 'luci.multikmwan', method: 'stservers'
 var callAddServer = rpc.declare({ object: 'luci.multikmwan', method: 'add_server',
                                   params: [ 'label', 'down', 'up' ] });
 
+// Mirrors WEB_DEFAULT_SITES / WEB_DEFAULT_DNS in the backend: what runs when
+// nothing is configured, so the form shows the real defaults, not blanks.
+var DEFAULT_SITES = [ 'https://www.facebook.com/', 'https://www.youtube.com/',
+                      'https://drive.google.com/', 'https://www.reddit.com/' ];
+var DEFAULT_DNS = 'https://cloudflare-dns.com/dns-query?name={name}&type=A';
+
 // Modal: search/browse speedtest.net (Ookla) servers and add one as a profile.
 // Each Ookla server speaks the classic HTTP protocol (random*.jpg download +
 // upload.php), which our fixed-file test handles.
@@ -85,7 +91,7 @@ return view.extend({
 	render: function() {
 		var m, s, o;
 
-		m = new form.Map('kmwan', _('Multi-WAN Mode & Priority'),
+		m = new form.Map('kmwan', _('Multi-WAN Settings'),
 			_('Failover uses one WAN at a time, picking the lowest priority number ' +
 			  'that is up. Load balance spreads NEW connections across the WANs in ' +
 			  'proportion to their ratio — note that a single connection always ' +
@@ -97,11 +103,12 @@ return view.extend({
 		// translated on save. cfgvalue derives the current choice from state.
 		o = s.option(form.ListValue, '_mode_pref', _('Mode'),
 			_('Failover uses one link at a time by priority. Load balance shares ' +
-			  'new connections by ratio. Fastest keeps the fastest link primary by ' +
-			  're-testing on a schedule (failover + auto-rank).'));
+			  'new connections by ratio. Fastest keeps the best link primary by ' +
+			  're-testing throughput, website response, latency and DNS on a ' +
+			  'schedule (failover + auto-rank).'));
 		o.value('failover', _('Failover — one link at a time, by priority'));
 		o.value('balancing', _('Load balance — share by ratio'));
-		o.value('fastest', _('Fastest — always the fastest link (auto-tested)'));
+		o.value('fastest', _('Fastest — always the best-scoring link (auto-tested)'));
 		o.cfgvalue = function() {
 			// The user's stored choice is the source of truth; fall back to a
 			// derivation only for configs from before mode_pref existed.
@@ -129,24 +136,87 @@ return view.extend({
 			opt.rmempty = false;
 		}
 
-		o = s.option(form.ListValue, '_rank_by', _('Rank by'),
-			_('Which measurement decides the fastest WAN, for both the manual ' +
-			  '"Rank WANs" button and auto-rank.'));
+		o = s.option(form.ListValue, '_rank_mode', _('Fastest means'),
+			_('Composite scores every link against the best one on four things: ' +
+			  'throughput from the speed test, website response (time to first ' +
+			  'byte of real pages, fetched over each link), ping latency from the ' +
+			  'background monitor, and DNS lookup time. Throughput only ignores ' +
+			  'the rest. Used by auto-rank, the "Rank WANs" button and the ' +
+			  'Fastest / Slowest client roles.'));
+		o.value('score', _('Composite — throughput + website response + latency + DNS'));
+		o.value('speed', _('Throughput only'));
+		mkopt('rank_mode', 'score');
+
+		o = s.option(form.ListValue, '_rank_by', _('Throughput measure'),
+			_('Which speed-test figure stands for throughput.'));
 		o.value('sum', _('Download + upload'));
 		o.value('down', _('Download only'));
 		o.value('up', _('Upload only'));
 		mkopt('rank_by', 'sum');
 
+		o = s.option(form.Value, '_score_w_speed', _('Weight: throughput'),
+			_('Share of the composite score. The four weights are normalised, ' +
+			  'so they need not add up to 100.'));
+		o.datatype = 'range(0,100)';
+		mkopt('score_w_speed', '40');
+
+		o = s.option(form.Value, '_score_w_web', _('Weight: website response'),
+			_('Time to first byte of each test page, averaged. Latency to the big ' +
+			  'CDNs is what makes browsing feel fast, so this is worth a large share.'));
+		o.datatype = 'range(0,100)';
+		mkopt('score_w_web', '25');
+
+		o = s.option(form.Value, '_score_w_latency', _('Weight: latency'),
+			_('Mean ping round trip to each link\'s probe target over the last ' +
+			  '5 minutes, from the background monitor. Costs no extra traffic.'));
+		o.datatype = 'range(0,100)';
+		mkopt('score_w_latency', '20');
+
+		o = s.option(form.Value, '_score_w_dns', _('Weight: DNS lookup'),
+			_('Median lookup time for the test pages\' hostnames, measured over ' +
+			  'each link.'));
+		o.datatype = 'range(0,100)';
+		mkopt('score_w_dns', '15');
+
+		o = s.option(form.DynamicList, '_web_sites', _('Test websites'),
+			_('Pages fetched over each WAN in every website test: one DNS lookup ' +
+			  'and one page download (a few hundred KB) each. Redirects count as ' +
+			  'a response, so a login or consent page is fine.'));
+		o.placeholder = 'https://www.example.com/';
+		o.cfgvalue = function() {
+			var v = uci.get('multikmwan', 'global', 'web_sites');
+			if (!v || !v.length) return DEFAULT_SITES.slice();
+			return Array.isArray(v) ? v : String(v).trim().split(/\s+/);
+		};
+		o.write = function(sid, v) { uci.set('multikmwan', 'global', 'web_sites', v); };
+		o.remove = function(sid) { uci.unset('multikmwan', 'global', 'web_sites'); };
+
+		o = s.option(form.Value, '_dns_url', _('DNS test resolver'),
+			_('A DNS-over-HTTPS JSON endpoint; {name} is replaced with each ' +
+			  'hostname. A plain UDP lookup cannot be pinned to one WAN, this can. ' +
+			  'Only the query round trip is timed, so the resolver\'s own name ' +
+			  'costs nothing. Cloudflare (default) and Google ' +
+			  'https://dns.google/resolve?name={name} both work.'));
+		o.placeholder = DEFAULT_DNS;
+		mkopt('dns_url', DEFAULT_DNS);
+
+		o = s.option(form.Value, '_web_timeout', _('Website test timeout'),
+			_('Seconds allowed per lookup and per page.'));
+		o.datatype = 'range(3,60)';
+		mkopt('web_timeout', '10');
+
 		o = s.option(form.Value, '_auto_rank', _('Auto-rank every'),
-			_('Minutes. 0 disables. Re-tests the non-metered WANs and puts the ' +
-			  'fastest first. Each applied change restarts kmwan, so see the margin below.'));
+			_('Minutes. 0 disables. Re-tests the non-metered WANs (speed, then ' +
+			  'websites) and puts the best first. Each applied change restarts ' +
+			  'kmwan, so see the margin below.'));
 		o.datatype = 'range(0,1440)';
 		o.placeholder = '15';
 		mkopt('auto_rank', '0');
 
 		o = s.option(form.Value, '_auto_margin', _('Only switch if faster by'),
-			_('Percent. A new leader must beat the current one by this much before ' +
-			  'kmwan is reconfigured - stops two similar lines flip-flopping.'));
+			_('Percent of the score. A new leader must beat the current one by ' +
+			  'this much before kmwan is reconfigured - stops two similar lines ' +
+			  'flip-flopping.'));
 		o.datatype = 'range(0,100)';
 		mkopt('auto_margin', '15');
 
@@ -219,13 +289,27 @@ return view.extend({
 			_('Define your own servers here, then pick one above. Use the ' +
 			  '"Browse speedtest.net" button to add a nearby Ookla server, or add ' +
 			  'one manually — {bytes} in the download URL is replaced with the test ' +
-			  'size, or point at a fixed-size file and leave {bytes} out.'));
+			  'size, or point at a fixed-size file and leave {bytes} out. A "Web ' +
+			  'page" server downloads a real site\'s own scripts and images from its ' +
+			  'CDN instead (e.g. https://www.facebook.com/), which shows what a line ' +
+			  'actually delivers for that site — ISPs often give speedtest servers ' +
+			  'a fast lane that real content never gets. Upload always uses the ' +
+			  'profile\'s upload URL or the fallback.'));
 		s.addremove = true;
 		s.anonymous = false;
 		s.nodescriptions = true;
 
 		o = s.option(form.Value, 'label', _('Name'));
 		o.placeholder = _('Home NAS');
+
+		o = s.option(form.ListValue, 'kind', _('Type'));
+		o.value('file', _('File or sized endpoint'));
+		o.value('page', _('Web page — its real content'));
+		o.default = 'file';
+		// The grid shows the raw key otherwise.
+		o.textvalue = function(sid) {
+			return this.cfgvalue(sid) === 'page' ? _('Web page') : _('File');
+		};
 
 		o = s.option(form.Value, 'down_url', _('Download URL'));
 		o.placeholder = 'http://192.168.0.50/100MB.bin';

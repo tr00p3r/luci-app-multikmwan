@@ -12,7 +12,7 @@
 		}
 	},
 	"admin/network/multikmwan/overview": {
-		"title": "Status & Speed",
+		"title": "Status",
 		"order": 1,
 		"action": {
 			"type": "view",
@@ -20,7 +20,7 @@
 		}
 	},
 	"admin/network/multikmwan/clients": {
-		"title": "Client Preference",
+		"title": "Devices",
 		"order": 2,
 		"action": {
 			"type": "view",
@@ -28,16 +28,21 @@
 		}
 	},
 	"admin/network/multikmwan/mode": {
-		"title": "Mode & Priority",
+		"title": "Settings",
 		"order": 3,
 		"action": {
 			"type": "view",
 			"path": "multikmwan/mode"
 		}
 	},
-	"admin/network/multikmwan/history": {
-		"title": "History (90d)",
+	"admin/network/multikmwan/quality": {
+		"title": "Quality",
 		"order": 4,
+		"action": { "type": "view", "path": "multikmwan/quality" }
+	},
+	"admin/network/multikmwan/history": {
+		"title": "History",
+		"order": 5,
 		"action": {
 			"type": "view",
 			"path": "multikmwan/history"

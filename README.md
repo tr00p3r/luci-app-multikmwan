@@ -23,8 +23,6 @@ Open **Network → MultiKmwan**. Needs a GL.iNet 4.x router with `kmwan`. Tested
 - **Real-content speed tests.** A speed-test server can be a web page (Facebook is included): the test pulls the site's own assets from its CDN, so you see what a line delivers for real content rather than a speedtest fast lane. Ookla and custom servers work as before.
 - **Devices.** Pin any LAN device to a line, an order of lines, or a role that follows the measurements: fastest, slowest or backup.
 - **Quality and History.** Continuous latency, jitter, loss and outage timeline per line, plus 90 days of uptime and speed.
-- **Safe by default.** Metered links are never tested and stay backup-only; busy links are skipped rather than measured under load; a failed transfer is retried and can never flip routing by itself.
-- **Privacy toggle** on every tab for shareable screenshots.
 
 How it works and the changelog: [release notes](../../releases) and the [wiki](../../wiki).
 

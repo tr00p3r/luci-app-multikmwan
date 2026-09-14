@@ -170,6 +170,18 @@ test('raw site grid keeps every measurement and marks the soonest answer', () =>
 	assert.match(overview.renderSites({ websites: [] }).textContent, /No website test yet/);
 });
 
+test('progress and carried-forward results are visible on the page', () => {
+	const busy = Object.assign({}, TWO, { testing: { active: true, kind: 'speed', wan: 'wan2', step: 'download-retry', index: '2', total: '2' } });
+	assert.match(overview.renderWans(busy).textContent, /wan2testing…/);
+	assert.equal(overview.progressText(busy, { profiles: [] }), 'Speed test: wan2, download, retry (2 of 2)…');
+	assert.equal(overview.progressText({ testing: { active: true, kind: 'web', wan: 'wan', step: 'facebook', index: '1', total: '1' } },
+		{ profiles: [{ id: 'facebook', label: 'Facebook' }] }), 'Website test: wan, Facebook…');
+	assert.equal(overview.progressText({ testing: { active: false } }, { profiles: [] }), '');
+	const stale = Object.assign({}, TWO, { testhistory: [{ epoch: '950', wan: 'wan', status: 'fail', download_status: 'http_200_exit_28', upload_status: 'ok' }] });
+	assert.match(overview.renderWans(stale).textContent, /↓ 559  ↑ 225 Mbps2 min agolast test failed, showing the previous result/);
+	assert.doesNotMatch(overview.renderWans(TWO).textContent, /previous result/);
+});
+
 test('mode and source lines stay short', () => {
 	assert.equal(overview.modeText({ now: 1000, mode: 'failover', enabled: '1',
 		autorank: { interval: '15', epoch: '700', decision: 'same-leader' } }),

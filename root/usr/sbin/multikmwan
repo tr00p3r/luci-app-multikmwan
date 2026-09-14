@@ -11,6 +11,9 @@ SPEEDHIST_FILE=/tmp/multikmwan.speedhist
 WEB_FILE=/tmp/multikmwan.web
 WEBSITES_FILE=/tmp/multikmwan.websites
 CONTENT_FILE=/tmp/multikmwan.content
+# What a running speed/website test is doing right now, for the Status page:
+#   kind wan step index total epoch   (removed when the run ends)
+PROGRESS_FILE=/tmp/multikmwan.progress
 # Persistent 90-day history lives on flash. Kept tiny: one rolled-up row per
 # WAN per day, flushed at most hourly, pruned to HIST_DAYS. An in-RAM
 # accumulator absorbs the frequent samples so flash is barely touched.
@@ -25,6 +28,13 @@ QUALITY_LIB=/usr/share/multikmwan
 WANS=""
 
 log() { logger -t multikmwan "$*"; [ -t 1 ] && echo "$*"; }
+
+# progress <speed|web> <wan> <step>: PROG_I/PROG_N (set by the run loop)
+# give "link 2 of 3". The file is rewritten at every step and deleted when
+# the run ends, so readers treat an old timestamp as a crashed run.
+progress() {
+	echo "$1 $2 $3 ${PROG_I:-0} ${PROG_N:-0} $(date +%s)" > "$PROGRESS_FILE"
+}
 
 # Lock an already-open descriptor, giving up after N seconds. BusyBox flock
 # (the one on GL.iNet firmware) has no -w, so the wait is a poll with -n.
@@ -382,7 +392,42 @@ st_one() {
 	tmpd="/tmp/mkst.$w.$$"
 	rm -rf "$tmpd"; mkdir -p "$tmpd"
 
-	# --- parallel download: each stream reports its own speed, we sum them ---
+	# Each direction gets one retry after a short pause: a stalled stream or a
+	# server hiccup (curl exit 28 on an otherwise fine link) must not turn
+	# into a failed round. Both attempts are ordinary transfers; only the
+	# last one's figures are reported.
+	progress speed "$w" download
+	st_download
+	if [ "$ST_DOWN_STATUS" != ok ]; then
+		log "speedtest: $w download $ST_DOWN_STATUS - retrying once"
+		sleep 2; progress speed "$w" download-retry
+		st_download
+	fi
+	progress speed "$w" upload
+	st_upload
+	if [ "$ST_UP_STATUS" != ok ]; then
+		log "speedtest: $w upload $ST_UP_STATUS - retrying once"
+		sleep 2; progress speed "$w" upload-retry
+		st_upload
+	fi
+	rm -rf "$tmpd"
+
+	dl=$(awk -v b="$bd" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
+	ul=$(awk -v b="$bu" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
+	# A download of 0 means the server was unreachable/blocked: flag it so the
+	# UI shows "failed" instead of a misleading "0 Mbps ok".
+	local stt=ok
+	[ "$ST_DOWN_STATUS" = ok ] && [ "$ST_UP_STATUS" = ok ] || stt=fail
+	st_report "$w" "$dl" "$ul" "$stt"
+}
+
+# One download attempt for st_one: every stream in parallel, then the sum.
+# Uses st_one's locals (dev, url_d, bytes, streams, to, tmpd) and leaves
+# bd, ST_DOWN_STATUS and ST_HOST_DOWN set. Stale per-stream files from a
+# previous attempt are cleared first so a shrunken asset list cannot leak.
+st_download() {
+	local i
+	rm -f "$tmpd"/d* "$tmpd"/de* "$tmpd"/p* "$tmpd"/a* "$tmpd"/assets "$tmpd"/page.html
 	if [ "$ST_DOWN_KIND" = page ]; then
 		st_page_download "$dev" "$ST_URL_DOWN" "$bytes" "$streams" "$to" "$tmpd"
 	else
@@ -401,10 +446,14 @@ st_one() {
 	ST_DOWN_STATUS=$(cat "$tmpd/dstatus")
 	ST_HOST_DOWN=$(cat "$tmpd/dhosts")
 	[ -n "$bd" ] || bd=0
+}
 
-	# --- parallel upload of generated data (/dev/zero). Total buffered across
-	#     streams is capped so a big test size can't OOM the router (curl buffers
-	#     --data-binary); 50 MB total is ample to measure an uplink. ---
+# One upload attempt for st_one: generated data (/dev/zero), one stream per
+# connection. Total buffered across streams is capped so a big test size
+# cannot OOM the router (curl buffers --data-binary); 50 MB is ample.
+st_upload() {
+	local i ub per
+	rm -f "$tmpd"/u* "$tmpd"/ue*
 	ub="$bytes"
 	[ "$ub" -gt 52428800 ] 2>/dev/null && ub=52428800
 	per=$((ub / streams))
@@ -424,15 +473,6 @@ st_one() {
 	ST_UP_STATUS=$(cat "$tmpd/ustatus")
 	ST_HOST_UP=$(cat "$tmpd/uhosts")
 	[ -n "$bu" ] || bu=0
-	rm -rf "$tmpd"
-
-	dl=$(awk -v b="$bd" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
-	ul=$(awk -v b="$bu" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
-	# A download of 0 means the server was unreachable/blocked: flag it so the
-	# UI shows "failed" instead of a misleading "0 Mbps ok".
-	local stt=ok
-	[ "$ST_DOWN_STATUS" = ok ] && [ "$ST_UP_STATUS" = ok ] || stt=fail
-	st_report "$w" "$dl" "$ul" "$stt"
 }
 
 # Reject HTTP error bodies, transport failures and incomplete directions.
@@ -474,10 +514,21 @@ cmd_speedtest() (
 	flock -n 7 || { echo 'speed test already running' >&2; return 1; }
 	local SPEED_FRESH_FILE="/tmp/multikmwan-fresh.$$" ST_META_FILE="/tmp/multikmwan-source.$$"
 	: > "$SPEED_FRESH_FILE"; : > "$ST_META_FILE"
-	trap 'rm -f "$SPEED_FRESH_FILE" "$ST_META_FILE"' EXIT
+	trap 'rm -f "$SPEED_FRESH_FILE" "$ST_META_FILE" "$PROGRESS_FILE"' EXIT
 	trap 'exit 1' INT TERM
 	_cmd_speedtest "$@"
 ) 7>/var/lock/multikmwan-speed.lock
+
+# Links a scheduled run will actually test: not disabled, not metered.
+run_targets() {
+	local w out=''
+	for w in $1; do
+		wan_disabled "$w" && continue
+		wan_metered "$w" && continue
+		out="$out $w"
+	done
+	echo $out
+}
 
 _cmd_speedtest() {
 	local targets="$*" w line explicit=1 guard thr dev busy prior
@@ -486,6 +537,7 @@ _cmd_speedtest() {
 	guard=$(g busy_skip 1)
 	thr=$(g busy_mbps 20)
 	local tmp="$SPEED_FILE.$$"
+	PROG_I=0; PROG_N=$(run_targets "$targets" | wc -w)
 	echo "# wan down_mbps up_mbps status epoch" > "$tmp"
 	for w in $targets; do
 		[ "$explicit" = 1 ] || ! wan_disabled "$w" || continue
@@ -514,13 +566,30 @@ _cmd_speedtest() {
 			fi
 		fi
 		log "speedtest: $w ..."
+		PROG_I=$((PROG_I + 1)); progress speed "$w" start
 		local ST_TEST_EPOCH
 		ST_TEST_EPOCH=$(date +%s)
 		line=$(st_one "$w")
-		echo "$line $ST_TEST_EPOCH" >> "$tmp"
+		case "$line" in
+			*" ok") echo "$line $ST_TEST_EPOCH" >> "$tmp" ;;
+			*)
+				# Still failed after the retry. Keep a recent good result (up to
+				# 6 h old) rather than dropping the link from the ranking: one bad
+				# transfer must not hand primary to a rival. The failed attempt
+				# stays in the test log, and the card says which it is showing.
+				prior=$(awk -v w="$w" -v min="$((ST_TEST_EPOCH - 21600))" \
+					'$1==w && $4=="ok" && $5>=min' "$SPEED_FILE" 2>/dev/null | head -1)
+				if [ -n "$prior" ]; then
+					echo "$prior" >> "$tmp"
+					log "speedtest: $w failed - keeping the result from $(( (ST_TEST_EPOCH - ${prior##* }) / 60 )) min ago"
+				else
+					echo "$line $ST_TEST_EPOCH" >> "$tmp"
+				fi ;;
+		esac
 		echo "$line $ST_TEST_EPOCH" >> "$SPEED_FRESH_FILE"
 		log "speedtest: $line"
 	done
+	rm -f "$PROGRESS_FILE"
 	mv "$tmp" "$SPEED_FILE"
 	hist_record_speed
 	hist_rollup speed
@@ -677,6 +746,7 @@ cmd_webtest() (
 	# Shares the speed-test lock: two measurements on one link at the same
 	# time would each distort the other.
 	flock -n 7 || { echo 'a speed or website test is already running' >&2; return 1; }
+	trap 'rm -f "$PROGRESS_FILE"' EXIT
 	trap 'exit 1' INT TERM
 	_cmd_webtest "$@"
 ) 7>/var/lock/multikmwan-speed.lock
@@ -692,6 +762,7 @@ _cmd_webtest() {
 	echo "# wan dns_ms first_byte_ms page_ms ok total status epoch" > "$tmpw"
 	echo "# wan host dns_ms first_byte_ms page_ms http status epoch" > "$tmps"
 	echo "# wan profile down_mbps status host epoch" > "$tmpc"
+	PROG_I=0; PROG_N=$(run_targets "$targets" | wc -w)
 	for w in $targets; do
 		now=$(date +%s)
 		[ "$explicit" = 1 ] || ! wan_disabled "$w" || continue
@@ -713,11 +784,13 @@ _cmd_webtest() {
 			fi
 		fi
 		log "webtest: $w ..."
+		PROG_I=$((PROG_I + 1)); progress web "$w" sites
 		line=$(web_wan "$w" "$dev" "$to" "$sites" "$tmps")
 		echo "$line" >> "$tmpw"
 		log "webtest: $line"
 		web_content "$w" "$dev" "$tmpc"
 	done
+	rm -f "$PROGRESS_FILE"
 	# A run naming specific WANs must not erase the others' results.
 	if [ "$explicit" = 1 ]; then
 		for w in $WANS; do
@@ -767,9 +840,19 @@ web_content() {
 		tmpd="/tmp/mkct.$w.$$"
 		rm -rf "$tmpd"; mkdir -p "$tmpd"
 		now=$(date +%s)
+		progress web "$w" "$p"
 		st_page_download "$dev" "$url" "$bytes" "$streams" "$to" "$tmpd"
 		bd=$(st_validate "$tmpd" d "$streams")
 		st=$(cat "$tmpd/dstatus"); host=$(cat "$tmpd/dhosts")
+		if [ "$st" != ok ]; then
+			# One retry, as the speed test does: a stalled stream is not a verdict.
+			log "webtest: $w $p $st - retrying once"
+			sleep 2; progress web "$w" "$p-retry"
+			rm -rf "$tmpd"; mkdir -p "$tmpd"
+			st_page_download "$dev" "$url" "$bytes" "$streams" "$to" "$tmpd"
+			bd=$(st_validate "$tmpd" d "$streams")
+			st=$(cat "$tmpd/dstatus"); host=$(cat "$tmpd/dhosts")
+		fi
 		rm -rf "$tmpd"
 		dl=$(awk -v b="${bd:-0}" 'BEGIN{ printf "%.2f", (b*8)/1000000 }')
 		echo "$w $p $dl $st ${host:-$(st_host "$url")} $now" >> "$out"
@@ -931,7 +1014,11 @@ cmd_autorank() {
 		cur_score=$(echo "$sorted" | awk -v w="$cur_lead" '$2==w {print $1}')
 		if [ "$new_lead" = "$cur_lead" ]; then
 			decision="same-leader"
-		elif [ -n "$cur_score" ] && awk -v n="$new_score" -v c="$cur_score" -v m="$margin" \
+		elif [ -z "$cur_score" ]; then
+			# The current leader has no score this round (its test failed and
+			# nothing recent could stand in). Missing data must not demote it.
+			decision="leader-unmeasured"
+		elif awk -v n="$new_score" -v c="$cur_score" -v m="$margin" \
 				'BEGIN{ exit !(n < c * (1 + m/100)) }'; then
 			decision="within-margin"
 		else

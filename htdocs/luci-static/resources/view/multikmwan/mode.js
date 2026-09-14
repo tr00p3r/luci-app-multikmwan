@@ -271,9 +271,10 @@ return view.extend({
 		mkopt('st_streams', '4');
 
 		o = s.option(form.Flag, '_busy_skip', _('Skip when busy'),
-			_('Skip a scheduled/auto test on a link that is already in use, and ' +
-			  'keep its last result. Avoids under-reporting and disrupting live ' +
-			  'traffic. Manual "Run speed test" always runs.'));
+			_('Skip a test on a link that is already carrying traffic, and keep ' +
+			  'its last result. A test under load would under-report and disrupt ' +
+			  'what is running. Applies to scheduled runs and the Status page ' +
+			  'buttons; a link named on the command line is always tested.'));
 		mkopt('busy_skip', '1');
 
 		o = s.option(form.Value, '_busy_mbps', _('Busy threshold'),

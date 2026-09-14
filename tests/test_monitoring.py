@@ -480,6 +480,59 @@ cmd_webtest >/dev/null; cat "$CONTENT_FILE"
         self.assertRegex(output, r'(?m)^wan facebook 32.00 ok cdn.example \d+$')
         self.assertNotIn(' cf ', output)
 
+    RETRY_MOCKS = """
+collect_wans() { WANS=wan; }
+g() { case "$1" in st_streams) echo 1;; st_bytes) echo 1000000;; busy_skip) echo 0;; *) echo "$2";; esac; }
+wan_metered() { return 1; }
+wan_dev() { echo eth0; }
+log() { echo "LOG $*" >> log.txt; }
+sleep() { :; }
+# Downloads fail (curl exit 28, a timeout) for the first FAIL_FIRST calls.
+curl() {
+    local n; n=$(cat calls 2>/dev/null || echo 0); n=$((n+1)); echo $n > calls
+    case "$*" in *--data-binary*) cat >/dev/null; echo '1000000 200 1000000 1 https://up.example/x'; return 0;; esac
+    if [ "$n" -le "${FAIL_FIRST:-0}" ]; then echo '0 200 100 25.0 https://dl.example/f'; return 28; fi
+    echo '1000000 200 1000000 1 https://dl.example/f'
+}
+"""
+
+    def test_failed_transfer_is_retried_once(self):
+        output = self.shell(self.RETRY_MOCKS + """
+FAIL_FIRST=1 ST_KIND=manual cmd_speedtest; echo "calls=$(cat calls)"; grep -c retrying log.txt
+""")
+        self.assertRegex(output, r'(?m)^wan 8.00 8.00 ok \d+$')
+        self.assertIn('calls=3', output)      # download, download again, upload
+        self.assertTrue(output.strip().endswith('1'))
+
+    def test_run_that_still_fails_keeps_a_recent_result_but_not_an_old_one(self):
+        output = self.shell(self.RETRY_MOCKS + """
+now=$(date +%s)
+printf '# h\\nwan 50.00 20.00 ok %s\\n' $((now - 600)) > "$SPEED_FILE"
+FAIL_FIRST=9 ST_KIND=manual cmd_speedtest >/dev/null; echo "--- kept:"; cat "$SPEED_FILE"; hist_flush; grep ',wan,' "$HIST_DIR/tests.csv"
+rm -f calls; printf '# h\\nwan 50.00 20.00 ok %s\\n' $((now - 30000)) > "$SPEED_FILE"
+FAIL_FIRST=9 ST_KIND=manual cmd_speedtest >/dev/null; echo "--- dropped:"; cat "$SPEED_FILE"
+""")
+        kept, dropped = output.split('--- dropped:')
+        # The 10-minute-old good result stands; the failed attempt is logged.
+        self.assertRegex(kept, r'(?m)^wan 50.00 20.00 ok \d+$')
+        self.assertIn(',wan,0.00,8.00,fail,manual,', kept)
+        self.assertIn('http_200_exit_28', kept)
+        # An 8-hour-old result is too old to stand in.
+        self.assertRegex(dropped, r'(?m)^wan 0.00 8.00 fail \d+$')
+
+    def test_autorank_never_demotes_a_leader_that_was_not_measured(self):
+        output = self.shell("""
+g() { case "$1" in rank_mode) echo speed;; auto_margin) echo 15;; *) echo "$2";; esac; }
+log() { :; }
+cmd_speedtest() { return 0; }
+current_order() { echo "wan wan2 "; }
+rank_sorted() { echo "100 wan2 50 50"; }
+rank_apply() { echo APPLIED; }
+cmd_autorank; cat "$AUTO_FILE"
+""")
+        self.assertIn('leader-unmeasured', output)
+        self.assertNotIn('APPLIED', output)
+
     def test_page_profile_without_assets_fails_loudly(self):
         html = self.file('page.html', '<html>no assets here</html>')
         output = self.shell(f'''

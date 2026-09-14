@@ -8,6 +8,7 @@ SPEEDHIST_FILE=/tmp/multikmwan.speedhist
 WEB_FILE=/tmp/multikmwan.web
 WEBSITES_FILE=/tmp/multikmwan.websites
 CONTENT_FILE=/tmp/multikmwan.content
+PROGRESS_FILE=/tmp/multikmwan.progress
 HIST_FILE=/etc/multikmwan/history.csv
 AUTO_FILE=/tmp/multikmwan.autorank
 
@@ -43,7 +44,7 @@ wans_json() {
 	pal=$(mk_wan_palette)
 	local w st dev ifup uptime gw state ptx prx kmst rxb txb
 	local rtt loss hep pubip isp city region country gep line oIFS base mode rf
-	local rmode rb v sf sc sp dp wp spd dn wb dl ul ns tt ld ok tot h hc lp lt
+	local rmode rb v sf sc sp dp wp spd dn wb dl ul ns tt ld ok tot h hc lp lt pk pw ps pi pn pe
 	mode=$(uci -q get kmwan.global.mode)
 	json_init
 	json_add_string mode "${mode:-failover}"
@@ -75,6 +76,21 @@ EOF
 	v=$(uci -q get multikmwan.global.score_w_web); json_add_string w_web "${v:-25}"
 	v=$(uci -q get multikmwan.global.score_w_latency); json_add_string w_latency "${v:-20}"
 	v=$(uci -q get multikmwan.global.score_w_dns); json_add_string w_dns "${v:-15}"
+	json_close_object
+
+	# A speed or website test in progress: what it is doing right now. The
+	# file is rewritten at each step and removed at the end; a timestamp older
+	# than ten minutes means a run died without cleaning up, so it is ignored.
+	json_add_object testing
+	pk=''; pw=''; ps=''; pi=''; pn=''; pe=''
+	[ -f "$PROGRESS_FILE" ] && read -r pk pw ps pi pn pe < "$PROGRESS_FILE"
+	if [ -n "$pk" ] && [ "$(( $(date +%s) - ${pe:-0} ))" -lt 600 ]; then
+		json_add_boolean active 1
+		json_add_string kind "$pk"; json_add_string wan "$pw"; json_add_string step "$ps"
+		json_add_string index "$pi"; json_add_string total "$pn"; json_add_string since "$pe"
+	else
+		json_add_boolean active 0
+	fi
 	json_close_object
 
 	json_add_object autorank

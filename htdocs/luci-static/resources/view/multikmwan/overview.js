@@ -58,7 +58,8 @@ var CSS = '' +
 '.mk-verdict{font-size:1.05em;margin:.2em 0 .8em 0}' +
 '.mk-list{list-style:none;padding:0;margin:.4em 0 .8em 0;font-size:.95em;line-height:1.8}' +
 '.mk-list b{font-weight:600}' +
-'details.mk-more{margin:.6em 0 1.2em 0}details.mk-more summary{cursor:pointer;opacity:.7;font-size:.9em}';
+'details.mk-more{margin:.6em 0 1.2em 0}details.mk-more summary{cursor:pointer;opacity:.7;font-size:.9em}' +
+'.mk-progress{margin:.2em 0 .8em 0;font-size:.95em}.mk-actions button[disabled]{opacity:.5}';
 
 // previous byte counters per WAN, for live throughput between polls
 var prev = {};
@@ -147,6 +148,22 @@ function grade(w, now, interval) {
 	return { cls: 'ok', label: _('healthy'), note: '' };
 }
 
+// "Speed test: wan, download (1 of 2)…" from the backend's progress record.
+function progressText(d, content) {
+	var t = d.testing;
+	if (!t || !t.active) return '';
+	var step = String(t.step || ''), retry = /-retry$/.test(step), base = step.replace(/-retry$/, ''), what;
+	var names = { start: _('starting'), download: _('download'), upload: _('upload'), sites: _('websites') };
+	if (names[base]) what = names[base];
+	else {
+		var pf = (content.profiles || []).filter(function(p) { return p.id === base; })[0];
+		what = pf ? pf.label : base;
+	}
+	var count = num(t.total) > 1 ? ' (' + t.index + _(' of ') + t.total + ')' : '';
+	return (t.kind === 'web' ? _('Website test: ') : _('Speed test: ')) + t.wan + ', ' + what +
+		(retry ? _(', retry') : '') + count + '…';
+}
+
 // Real-content rows (Facebook and any other "page" profile) grouped as
 // profiles[] in first-seen order and by[wan][profile].
 function contentIndex(d) {
@@ -160,6 +177,7 @@ function contentIndex(d) {
 
 return view.extend({
 	load: function() { return callStatus(); },
+	progressText: progressText,
 
 	renderWans: function(d) {
 		var now = num(d.now) || Math.floor(Date.now() / 1000);
@@ -195,6 +213,10 @@ return view.extend({
 			}
 			if (!wbNote) wbNote = (w.metered === '1') ? _('metered: websites not tested') : _('no website test yet');
 			var sc = scores[w.name];
+			var testing = d.testing && d.testing.active && d.testing.wan === w.name;
+			// A failed run keeps the previous good figures; say so next to them.
+			var latest = (d.testhistory || []).filter(function(t) { return t.wan === w.name; }).pop();
+			var stale = sp && latest && latest.status !== 'ok' && num(latest.epoch) > num(sp.epoch);
 
 			var rx = num(w.rx_bytes) || 0, tx = num(w.tx_bytes) || 0, live = null, p = prev[w.name];
 			if (p && tnow > p.t + 0.5)
@@ -234,7 +256,8 @@ return view.extend({
 					E('span', {}, [
 						E('span', { 'class': 'mk-dot', 'style': 'background:' + (w.color || '#888') }),
 						w.name, w.metered === '1'
-							? E('span', { 'class': 'mk-tag' }, _('metered')) : '' ]),
+							? E('span', { 'class': 'mk-tag' }, _('metered')) : '',
+						testing ? E('span', { 'class': 'mk-tag mk-lead' }, _('testing…')) : '' ]),
 					E('span', { 'class': 'mk-pill mk-' + g.cls }, g.label)
 				]),
 				E('div', { 'class': 'mk-meta' }, meta),
@@ -253,7 +276,9 @@ return view.extend({
 				]),
 				E('div', { 'class': 'mk-speed' }, sp
 					? [ E('span', {}, [ '↓ ', E('b', {}, fmtSpeed(sp.down)), '  ↑ ', E('b', {}, fmtSpeed(sp.up)), ' Mbps' ]),
-					    E('span', { 'class': 'mk-dim' }, ago(sp.epoch, now)) ]
+					    E('span', { 'class': 'mk-dim' }, ago(sp.epoch, now)),
+					    stale ? E('span', { 'class': 'mk-note', 'title': (latest.download_status || '') + ' / ' + (latest.upload_status || '') },
+							_('last test failed, showing the previous result')) : '' ]
 					: [ E('span', { 'class': 'mk-dim' }, spNote) ]),
 				E('div', { 'class': 'mk-bar' }, [
 					E('span', { 'style': 'width:' + pct.toFixed(0) + '%' })
@@ -586,6 +611,27 @@ return view.extend({
 	render: function(d) {
 		var self = this;
 
+		// Starting a test shows progress on the page instead of a pop-up: the
+		// backend reports each step, and until its first report arrives the
+		// line says "Starting…" (for at most 20 s, in case the start failed).
+		var progress = E('p', { 'class': 'mk-progress spinning', 'id': 'mk-progress' }, '');
+		progress.style.display = 'none';
+		var testButtons = [];
+		function start(kind, call) {
+			return function() {
+				self.starting = { kind: kind, at: Date.now() };
+				return call().then(function() { return self.refresh(); }, function(e) {
+					self.starting = null;
+					ui.addNotification(null, E('p', _('Could not start the test: ') + (e.message || e)), 'error');
+				});
+			};
+		}
+		var runSpeed = E('button', { 'class': 'cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(this, start('speed', callSpeed)) }, _('Run speed test'));
+		var runWeb = E('button', { 'class': 'cbi-button cbi-button-action',
+			'click': ui.createHandlerFn(this, start('web', callWeb)) }, _('Test websites'));
+		testButtons.push(runSpeed, runWeb);
+
 		var body = E('div', {}, [
 			E('style', {}, CSS),
 			E('h2', {}, _('MultiKmwan')),
@@ -595,20 +641,8 @@ return view.extend({
 			E('div', { 'id': 'mk-cards' }, this.renderWans(d)),
 
 			E('div', { 'class': 'mk-actions' }, [
-				E('button', {
-					'class': 'cbi-button cbi-button-action',
-					'click': ui.createHandlerFn(this, function() {
-						ui.addNotification(null, E('p', _('Speed test running, up to a minute per link.')), 'info');
-						return callSpeed();
-					})
-				}, _('Run speed test')),
-				E('button', {
-					'class': 'cbi-button cbi-button-action',
-					'click': ui.createHandlerFn(this, function() {
-						ui.addNotification(null, E('p', _('Website test running.')), 'info');
-						return callWeb();
-					})
-				}, _('Test websites')),
+				runSpeed,
+				runWeb,
 				E('button', {
 					'class': 'cbi-button cbi-button-apply',
 					'click': ui.createHandlerFn(this, function() {
@@ -643,6 +677,7 @@ return view.extend({
 					})
 				}, _('Sync device rules'))
 			]),
+			progress,
 			E('p', { 'id': 'mk-test-source', 'class': 'mk-dim' }, this.sourceText(d)),
 
 			E('h3', {}, _('Recent speed tests')),
@@ -652,7 +687,7 @@ return view.extend({
 			E('div', { 'id': 'mk-rules' }, this.renderRules(d))
 		]);
 
-		poll.add(function() {
+		this.refresh = function() {
 			return callStatus().then(function(nd) {
 				var c = document.getElementById('mk-cards');
 				var r = document.getElementById('mk-rules');
@@ -670,8 +705,18 @@ return view.extend({
 				if (m) m.textContent = self.modeText(nd);
 				if (g) { g.innerHTML = ''; g.appendChild(self.renderGraph(nd)); }
 				document.querySelectorAll('details.mk-more').forEach(function(el) { if (open[el.querySelector('summary').textContent]) el.open = true; });
+
+				var active = nd.testing && nd.testing.active, text = progressText(nd, contentIndex(nd));
+				if (active) self.starting = null;
+				else if (self.starting && Date.now() - self.starting.at < 20000)
+					text = (self.starting.kind === 'web' ? _('Starting website test…') : _('Starting speed test…'));
+				else self.starting = null;
+				progress.textContent = text;
+				progress.style.display = text ? '' : 'none';
+				testButtons.forEach(function(b) { b.disabled = !!(active || self.starting); });
 			});
-		}, 5);
+		};
+		poll.add(function() { return self.refresh(); }, 5);
 
 		return body;
 	},
